@@ -2,7 +2,7 @@
 
 > Interface graphique tout-en-un pour convertir, télécharger, ajuster et redimensionner vos médias — propulsé par FFmpeg.
 
-![⬇️ Télécharger](https://github.com/MATTRAX64/Medias_Toolkits/releases/latest/download/MediaToolkit.py)
+[⬇️ Télécharger](https://github.com/MATTRAX64/Medias_Toolkits/releases/latest/download/MediaToolkit.py)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-required-green?logo=ffmpeg&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows)
