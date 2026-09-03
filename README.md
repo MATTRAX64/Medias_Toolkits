@@ -7,7 +7,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-purple)
 
-[⬇️ Télécharger](https://github.com/MATTRAX64/Medias_Toolkits/releases/latest/download/MediaToolkit.py)
+[⬇️ Télécharger](https://github.com/MATTRAX64/Medias_Toolkits/releases/latest/download/MediaToolkit.pyw)
 
 ---
 
