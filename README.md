@@ -18,10 +18,10 @@
 | Onglet | Fonctionnalité |
 |---|---|
 | **Format Changer** | Convertit en lot vidéos, images et audios vers les formats de votre choix |
-| **YouTube** | Télécharge des vidéos / playlists YouTube via yt-dlp |
 | **Couleurs** | Ajuste saturation, luminosité, contraste et gamma d'images |
 | **Redimensionner** | Réduit des images à une hauteur max en préservant le ratio |
 | **Paramètres** | Configure FFmpeg une seule fois, partagé par tous les outils |
+| **Autres...** |
 
 ---
 
@@ -29,7 +29,6 @@
 
 - **Python 3.8+** (tkinter inclus sur Windows)
 - **FFmpeg** — [Télécharger sur ffmpeg.org](https://ffmpeg.org/download.html)
-- **yt-dlp** — installé automatiquement au premier lancement de l'onglet YouTube (ou via le bouton dans Paramètres)
 
 > FFmpeg doit être dans votre `PATH` ou localisé manuellement dans l'onglet ⚙ Paramètres.
 
