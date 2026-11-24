@@ -1,120 +1,60 @@
-# ◈ Media Toolkit
+# Media Toolkit
 
-> Interface graphique tout-en-un pour convertir, télécharger, ajuster et redimensionner vos médias — propulsé par FFmpeg.
+Application Windows pour **compresser, convertir et monter rapidement** des vidéos, des images et des fichiers audio avec FFmpeg. L’interface pywebview est intégrée à un seul fichier `MediaToolkit.pyw`.
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
-![FFmpeg](https://img.shields.io/badge/FFmpeg-required-green?logo=ffmpeg&logoColor=white)
-![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows)
-![License](https://img.shields.io/badge/License-MIT-purple)
-
-[⬇️ Télécharger](https://github.com/MATTRAX64/Medias_Toolkits/releases/latest/download/MediaToolkit.pyw)
-
----
-
-## Aperçu
-
-**Media Toolkit** est une application de bureau légère (tkinter, aucune dépendance lourde) qui regroupe en un seul endroit les opérations les plus courantes sur les fichiers multimédia :
-
-| Onglet | Fonctionnalité |
-|---|---|
-| **Format Changer** | Convertit en lot vidéos, images et audios vers les formats de votre choix |
-| **Couleurs** | Ajuste saturation, luminosité, contraste et gamma d'images |
-| **Redimensionner** | Réduit des images à une hauteur max en préservant le ratio |
-| **Paramètres** | Configure FFmpeg une seule fois, partagé par tous les outils |
-| **Autres...** |
-
----
-
-## Prérequis
-
-- **Python 3.8+** (tkinter inclus sur Windows)
-- **FFmpeg** — [Télécharger sur ffmpeg.org](https://ffmpeg.org/download.html)
-
-> FFmpeg doit être dans votre `PATH` ou localisé manuellement dans l'onglet ⚙ Paramètres.
-
----
+[Voir les versions sur GitHub](https://github.com/MATTRAX64/Medias_Toolkits/releases)
 
 ## Installation
 
-```bash
-# 1. Cloner le dépôt
-git clone https://github.com/votre-utilisateur/media-toolkit.git
-cd media-toolkit
+- **Windows et Python 3**. La version actuelle a été testée avec Python 3.13.
+- **FFmpeg et FFprobe**. Ajoute-les au `PATH` ou indique le chemin de `ffmpeg.exe` dans **Paramètres**. [Télécharger FFmpeg](https://ffmpeg.org/download.html)
 
-# 2. (Optionnel) Créer un environnement virtuel
-python -m venv venv
-venv\Scripts\activate  # Windows
+Place `MediaToolkit.pyw` dans le dossier de ton choix et ouvre-le en double-cliquant dessus. L’application tente d’installer les dépendances Python manquantes au premier lancement. Pour les installer manuellement, ouvre PowerShell dans le dossier du fichier et exécute :
 
-# 3. Aucune dépendance pip requise au démarrage
-#    yt-dlp s'installe automatiquement si nécessaire
-
-# 4. Lancer l'application
-python MediaToolkit.py
+```powershell
+python -m pip install pywebview pillow pillow-heif
+python .\MediaToolkit.pyw
 ```
 
----
+## Compresser une vidéo
 
-## Utilisation
+1. Ajoute un ou plusieurs fichiers, ou sélectionne un dossier.
+2. Choisis le **format final**. Le format vidéo par défaut est **MP4**. Tu peux aussi choisir **MKV** ou **WebM**. Pour l’audio seul, choisis **M4A** ou **MP3**.
+3. Choisis **720p compact (AV1)**, **1080p qualité (AV1)** ou **720p compatible (H.264)**. Le profil WebM utilise AV1.
+4. Garde la taille en **Auto** ou règle une **Taille cible** en Mo par fichier. Le poids obtenu peut varier légèrement selon l’encodage.
+5. Clique sur **Tester 5 s** pour comparer la vidéo d’origine et le rendu. **Estimer le temps et le poids** encode quelques extraits avec les réglages choisis.
+6. Lance l’export. Le journal indique la taille et le temps d’encodage réels. La compression conserve l’original et enregistre une copie uniquement si elle est plus légère.
 
-### Format Changer
-Sélectionne un dossier source, choisis les formats cibles pour la vidéo, l'image et l'audio, puis lance la conversion. Tous les sous-dossiers sont traités récursivement. Les fichiers déjà convertis (marqués `_CONV`) sont ignorés.
+### Carte graphique
 
-**Formats vidéo supportés :** `mp4`, `mkv`, `mov`, `webm`, `avi`  
-**Formats image supportés :** `jpg`, `png`, `webp`, `avif`, `tiff`, `bmp`, `gif`  
-**Formats audio supportés :** `mp3`, `flac`, `aac`, `ogg`, `opus`, `wav`, `m4a`
+Pour les profils AV1, tu peux choisir **Intel Quick Sync**, **NVIDIA NVENC**, **CPU (SVT-AV1)** ou laisser **Auto**. Le mode automatique essaie Intel, puis NVIDIA, puis le CPU. Les options matérielles dépendent de la carte, du pilote et des encodeurs disponibles dans FFmpeg. Le profil compatible H.264 utilise le CPU.
 
-### YouTube
-Colle une URL YouTube (vidéo ou playlist), choisis le format de sortie et le dossier de destination. Les téléchargements se font en parallèle.
+## Convertir et ajuster
 
-**Formats disponibles :** MP3 (192/320 kbps), MP4 (meilleur/1080p/720p), FLAC, AAC, Opus
+Convertis en lot des vidéos, images ou fichiers audio. Les formats courants apparaissent en premier et la case **Afficher les formats avancés** donne accès au reste.
 
-### Couleurs
-Ajuste les propriétés colorimétriques d'une image unique ou d'un dossier entier via des sliders (-100 → +100). Le format de sortie peut être conservé ou changé à la volée.
+Dans le même écran, tu peux limiter la hauteur en conservant les proportions, puis régler la saturation, la luminosité, le contraste et le gamma. **Voir l’aperçu** montre l’image exportée ou deux courts extraits vidéo avant/après.
 
-### Redimensionner
-Définit une **hauteur maximale** en pixels — la largeur s'adapte automatiquement au ratio. Les images déjà plus petites ne sont pas modifiées.
+## Montage rapide
 
-- Raccourcis rapides : `240p` → `4320p`
-- Saisie manuelle libre
-- Suffixe personnalisable (vide = remplacement en place)
+| Catégorie | Outils |
+| --- | --- |
+| Montage vidéo | Couper, fusionner des fichiers compatibles, appliquer une rotation ou un miroir |
+| Images et captures | Créer un GIF, capturer une image, exporter une séquence d’images |
+| Audio | Extraire ou retirer le son, régler le volume, normaliser le niveau sonore |
 
----
+Pour couper une vidéo, renseigne le début et la fin en secondes ou au format `hh:mm:ss`. Tu peux lire les cinq secondes qui suivent le début choisi avant d’exporter.
 
-## Accélération GPU
+## Analyse et préférences
 
-Si une carte NVIDIA compatible CUDA est détectée, la conversion vidéo utilise automatiquement l'encodeur `hevc_nvenc` pour des conversions bien plus rapides. L'onglet Paramètres indique si le GPU est actif.
+**Analyser** affiche les informations du média, notamment sa résolution, sa durée, ses codecs et son débit. Dans **Paramètres**, configure FFmpeg et choisis où enregistrer les copies, avec un suffixe ou dans un sous-dossier.
 
----
-
-## Configuration
-
-Les réglages sont sauvegardés automatiquement dans `mediatoolkit.json` dans le dossier du script. Ce fichier est recréé s'il est supprimé.
-
----
-
-## Structure du projet
-
-```
-media-toolkit/
-├── MediaToolkit.py      # Application principale (script unique)
-├── mediatoolkit.json    # Config auto-générée (ignorée par git)
-└── README.md
-```
-
----
+Les préférences sont sauvegardées dans le registre Windows de l’utilisateur. Le fichier `MediaToolkit.pyw` contient le code et l’interface et se suffit à lui-même côté projet.
 
 ## Contribuer
 
-Les pull requests sont les bienvenues. Pour les changements majeurs, ouvre d'abord une issue pour discuter de ce que tu souhaites modifier.
-
-1. Fork le projet
-2. Crée ta branche (`git checkout -b feature/ma-fonctionnalite`)
-3. Commit tes changements (`git commit -m 'feat: ajout de ma fonctionnalité'`)
-4. Push sur la branche (`git push origin feature/ma-fonctionnalite`)
-5. Ouvre une Pull Request
-
----
+Pour signaler un problème, indique ta version de Windows, de Python et de FFmpeg, ainsi que le format du fichier et les réglages d’export. [Issues GitHub](https://github.com/MATTRAX64/Medias_Toolkits/issues)
 
 ## Licence
 
-Distribué sous licence MIT. Voir `LICENSE` pour plus d'informations.
+MIT.
