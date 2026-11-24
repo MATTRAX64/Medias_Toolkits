@@ -1,5 +1,5 @@
 """
-MediaToolkit  —  v3  (interface pywebview)
+MediaToolkit  —  v4  (interface pywebview)
 ──────────────────────────────────────────────────────────────────────
 Convertir · Couleurs (aperçu) · Redimensionner · Outils vidéo/audio
 
@@ -9,9 +9,13 @@ Installation (une seule fois) :
 FFmpeg est nécessaire (auto-détecté, sinon à indiquer dans Paramètres).
 """
 
-import os, sys, re, json, shutil, base64, threading, subprocess, tempfile, time, io
+import os, sys, re, json, shutil, base64, threading, subprocess, tempfile, time, io, uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Event
+from pathlib import Path
+
+if os.name == "nt":
+    import winreg
 
 # ── dépendances : installées automatiquement si absentes ───────────────
 def _pip(*pkgs):
@@ -47,38 +51,57 @@ if HAS_PIL:
 
 NOWIN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 HERE  = os.path.dirname(os.path.abspath(__file__))
-CFG_FILE = os.path.join(HERE, "mediatoolkit.json")
+LEGACY_CFG = Path(HERE) / "mediatoolkit.json"
+REGISTRY_KEY = r"Software\MediaToolkit"
 
 # ═══════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════════════
 DEFAULTS = {
     "ffmpeg": "", "ffprobe": "",
-    "threads": max(1, (os.cpu_count() or 4) // 2),
+    "threads": 2,
     "use_gpu": True,
-    "overwrite_mode": "replace",      # replace | suffix | subfolder
+    "overwrite_mode": "suffix",
     "suffix": "_conv",
     "subfolder": "converted",
     "recursive": True,
     "keep_metadata": True,
-    "delete_source": True,
+    "delete_source": False,
     "last_folder": "",
 }
 
 def cfg_load():
-    c = dict(DEFAULTS)
-    if os.path.isfile(CFG_FILE):
+    config = dict(DEFAULTS)
+    saved = {}
+    if os.name == "nt":
         try:
-            c.update(json.loads(open(CFG_FILE, encoding="utf-8").read()))
-        except Exception:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_KEY) as key:
+                saved = json.loads(winreg.QueryValueEx(key, "Preferences")[0])
+        except (OSError, ValueError):
             pass
-    return c
-
-def cfg_save(c):
+    if not saved and LEGACY_CFG.is_file():
+        try:
+            saved = json.loads(LEGACY_CFG.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            pass
+    if isinstance(saved, dict):
+        config.update(saved)
+    config.update(delete_source=False)
+    if config["overwrite_mode"] not in ("suffix", "subfolder"):
+        config["overwrite_mode"] = "suffix"
     try:
-        open(CFG_FILE, "w", encoding="utf-8").write(json.dumps(c, indent=2, ensure_ascii=False))
-    except Exception:
-        pass
+        config["threads"] = min(8, max(1, int(config.get("threads") or 2)))
+    except (ValueError, TypeError):
+        config["threads"] = DEFAULTS["threads"]
+    return config
+
+def cfg_save(config):
+    if os.name == "nt":
+        try:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REGISTRY_KEY) as key:
+                winreg.SetValueEx(key, "Preferences", 0, winreg.REG_SZ, json.dumps(config, ensure_ascii=False))
+        except OSError:
+            pass
 
 # ═══════════════════════════════════════════════════════════════════════
 #  CATALOGUE DE FORMATS
@@ -580,6 +603,7 @@ class Api:
         info = {
             "cfg": self.cfg, "has_ffmpeg": bool(ff and os.path.isfile(ff)),
             "has_pil": HAS_PIL,
+            "adapters": self.graphics_adapters(),
             "targets": {
                 "video": {k: v["label"] for k, v in VIDEO_TARGETS.items()},
                 "audio": {k: v["label"] for k, v in AUDIO_TARGETS.items()},
@@ -591,7 +615,26 @@ class Api:
         }
         return info
 
+    @staticmethod
+    def graphics_adapters():
+        if os.name != "nt":
+            return {}
+        try:
+            result = run_quiet(["powershell.exe", "-NoProfile", "-Command",
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                "Get-CimInstance Win32_VideoController -ErrorAction Stop | Select-Object -ExpandProperty Name"], 8)
+            names = result.stdout.splitlines()
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        return {key: name.strip() for key, vendor in (("intel", "intel"), ("nvidia", "nvidia"))
+                for name in names if vendor in name.lower()}
+
     def set_cfg(self, key, value):
+        if key in ("delete_source", "overwrite_mode") and value not in ("suffix", "subfolder"):
+            return False
+        if key in ("suffix", "subfolder"):
+            if not isinstance(value, str) or re.search(r'[\/:*?"<>|]', value) or value in (".", ".."):
+                return False
         self.cfg[key] = value
         cfg_save(self.cfg)
         return True
@@ -611,7 +654,7 @@ class Api:
             ver = "?"
         key_enc = ["libx264","libx265","libsvtav1","libaom-av1","libvpx-vp9","libmp3lame","libopus",
                    "libvorbis","flac","libwebp","libjxl","prores_ks","ffv1","h264_nvenc","hevc_nvenc",
-                   "av1_nvenc","h264_qsv","h264_amf"]
+                   "av1_nvenc","av1_qsv","h264_qsv","h264_amf"]
         return {"ok": True, "path": ff, "version": ver, "gpu": gpu_available(ff),
                 "n_encoders": len(enc), "encoders": {k: (k in enc) for k in key_enc}}
 
@@ -703,7 +746,7 @@ class Api:
         return out
 
     # ── APERÇU COULEURS / REDIMENSIONNEMENT ──
-    def preview(self, path, color, resize, maxdim=900, at=0.0):
+    def preview(self, path, color, resize, maxdim=900, at=0.0, job=None):
         """
         Génère un aperçu AVANT/APRÈS (PNG base64) d'un fichier image ou d'un
         instant d'une vidéo, en appliquant EXACTEMENT les mêmes filtres ffmpeg
@@ -755,13 +798,27 @@ class Api:
             res = {"ok": True, "orig_w": ow, "orig_h": oh}
             b, err = render("", "before.png")
             if not b: return {"ok": False, "err": err or "Rendu impossible"}
-            a, err2 = render(vf_after, "after.png")
+            if job and kind == "image":
+                temp_src = os.path.join(tmpdir, "media" + ext)
+                shutil.copyfile(path, temp_src)
+                export_job = dict(job, mode="combo")
+                options = dict(DEFAULTS, overwrite_mode="suffix", suffix="_preview")
+                status, message = self._one(temp_src, export_job, options, ff, list_encoders(ff), False)
+                if status == "err":
+                    return {"ok": False, "err": message}
+                target = export_job.get("targets", {}).get("image") or ext.lstrip(".")
+                src = os.path.join(tmpdir, f"media_preview.{target}") if status == "ok" else src
+                info = self.media_info(src)
+                res.update(final_w=info.get("w"), final_h=info.get("h"), size=info.get("size"))
+                a, err2 = render("", "after.png")
+            else:
+                a, err2 = render(vf_after, "after.png")
             if not a: return {"ok": False, "err": err2 or "Filtre invalide"}
             res["before"] = "data:image/png;base64," + base64.b64encode(open(b, "rb").read()).decode()
             res["after"]  = "data:image/png;base64," + base64.b64encode(open(a, "rb").read()).decode()
 
             # dimensions finales (sans réduction d'aperçu)
-            if ow and oh:
+            if ow and oh and not res.get("final_w"):
                 fw, fh = self._final_size(ow, oh, resize)
                 res["final_w"], res["final_h"] = fw, fh
             return res
@@ -839,17 +896,18 @@ class Api:
         return base + ne
 
     def _finish_file(self, src, tmp, dst, opts):
-        """Remplace / déplace le fichier temporaire vers la destination finale."""
         if not (os.path.isfile(tmp) and os.path.getsize(tmp) > 0):
-            if os.path.isfile(tmp): os.remove(tmp)
+            if os.path.isfile(tmp):
+                os.remove(tmp)
             return False
-        same = os.path.normcase(os.path.abspath(dst)) == os.path.normcase(os.path.abspath(src))
-        if opts.get("overwrite_mode", "replace") == "replace":
-            if not same and opts.get("delete_source", True) and os.path.isfile(src):
-                try: os.remove(src)
-                except Exception: pass
-        os.replace(tmp, dst)
-        return True
+        stem, ext = os.path.splitext(dst)
+        with self._lock:
+            index = 1
+            while os.path.lexists(dst):
+                dst = f"{stem}_{index}{ext}"
+                index += 1
+            os.rename(tmp, dst)
+        return dst
 
     # ── TRAITEMENT PRINCIPAL (un seul moteur pour tout) ──
     def process(self, job):
@@ -968,9 +1026,12 @@ class Api:
         if mode in ("color", "resize", "combo") and kind == "audio" and not target:
             return ("skip", f"{name}  (audio ignoré)")
 
+        if mode == "combo" and not vfilters and (not target or ext == "." + target):
+            return ("skip", f"{name} (aucune modification)")
+
         new_ext = target or ext.lstrip(".")
         dst = self._dest(path, new_ext, opts)
-        tmp = os.path.join(os.path.dirname(dst), os.path.splitext(os.path.basename(dst))[0] + "_CONVTMP." + new_ext.lstrip("."))
+        tmp = os.path.join(os.path.dirname(dst), f"_CONVTMP_{uuid.uuid4().hex}.{new_ext}")
         if not opts.get("keep_metadata", True):
             meta = ["-map_metadata", "-1"]
         else:
@@ -985,8 +1046,7 @@ class Api:
         if kind == "video":
             vcodec = job.get("vcodec") or (VIDEO_TARGETS.get(new_ext, {}).get("vcodecs") or ["h264"])[0]
             acodec = job.get("acodec") or "aac"
-            hw = ["-hwaccel", "cuda"] if gpu and vcodec in ("h264", "h265", "av1") else []
-            cmd += hw + ["-i", path]
+            cmd += ["-i", path]
             if new_ext in ("gif",):
                 pal = (vfilters + "," if vfilters else "") + "fps=15,scale='min(720,iw)':-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse"
                 cmd += ["-filter_complex", pal, "-an", "-loop", "0"]
@@ -1063,7 +1123,8 @@ class Api:
             return ("err", f"{name}  —  {lines[-1][:160] if lines else 'erreur ffmpeg'}")
 
         before = os.path.getsize(path) if os.path.isfile(path) else 0
-        if self._finish_file(path, tmp, dst, opts):
+        dst = self._finish_file(path, tmp, dst, opts)
+        if dst:
             after = os.path.getsize(dst)
             delta = ""
             if before and after:
@@ -1102,7 +1163,8 @@ class Api:
                 bgc.paste(im, mask=im.split()[-1] if "A" in im.getbands() else None); im = bgc
             im.save(tmp, format=fmt, quality=q)
             before = os.path.getsize(path)
-            if self._finish_file(path, tmp, dst, opts):
+            dst = self._finish_file(path, tmp, dst, opts)
+            if dst:
                 return ("ok", f"{os.path.basename(dst)}  ({human(before)} → {human(os.path.getsize(dst))})")
             return ("err", f"{name}  (sortie vide)")
         except Exception as e:
@@ -1115,8 +1177,8 @@ class Api:
     def run_tool(self, job):
         """
         job = {tool, files, out_dir, params}
-        tools : extract_audio | trim | speed | gif | thumbnail | strip_audio | mute
-                normalize | volume | rotate | flip | merge_audio | frames | compress_target
+        tools : extract_audio | trim | gif | thumbnail | strip_audio | mute
+                normalize | volume | rotate | flip | merge_audio | frames
         """
         ff = self._need_ff()
         if not ff: return {"ok": False, "err": "FFmpeg non configuré"}
@@ -1171,39 +1233,125 @@ class Api:
             d = os.path.join(d, opts.get("subfolder", "converted") or "converted")
             os.makedirs(d, exist_ok=True)
         # Les outils ne remplacent JAMAIS l'original : ils ajoutent toujours un suffixe
-        return os.path.join(d, f"{base}{suffix}.{ext.lstrip('.')}")
+        out = os.path.join(d, f"{base}{suffix}.{ext.lstrip('.')}")
+        if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(path)):
+            out = os.path.join(d, f"{base}_outil.{ext.lstrip('.')}")
+        return out
 
-    def _smart_command(self, ff, path, out, p, start=None, duration=None):
-        vb, ab = int(p.get("video_kbps", 1000)), int(p.get("audio_kbps", 96))
-        height = int(p.get("height", 720))
-        if not 50 <= vb <= 100000 or not 16 <= ab <= 320:
-            raise ValueError("Débits autorisés : vidéo 50–100000, audio 16–320 kbit/s")
-        if height not in (0, 360, 480, 720, 1080): raise ValueError("Résolution invalide")
-        codec, speed = p.get("codec", "h264"), p.get("preset", "medium")
-        if codec not in ("h264", "h265"): raise ValueError("Codec invalide")
-        if speed not in ("fast", "medium", "slow"): raise ValueError("Vitesse invalide")
-        cmd = [ff, "-hide_banner", "-loglevel", "error", "-y"]
-        if start is not None: cmd += ["-ss", str(start)]
-        cmd += ["-i", path]
-        if duration is not None: cmd += ["-t", str(duration)]
+    @staticmethod
+    def _compression_ext(path, params):
+        audio = ext_kind(os.path.splitext(path)[1]) == "audio"
+        ext = params.get("audio_format", "m4a") if audio else params.get("format", "mp4")
+        allowed = {"m4a", "mp3"} if audio else {"mp4", "mkv", "webm"}
+        if ext not in allowed:
+            raise ValueError("Format de sortie invalide")
+        if ext == "webm" and params.get("profile") == "compatible":
+            raise ValueError("Choisis le profil AV1 pour le format WebM")
+        return ext
+
+    def _compression_budget(self, path, params, duration):
+        target = float(params.get("target_mb") or 0)
+        if not target:
+            return {}
+        if not 0.1 <= target <= 100000 or duration <= 0:
+            raise ValueError("La taille cible doit être entre 0,1 et 100 000 Mo, avec une durée connue.")
+        total = int(target * 8000 * .97 / duration)
+        audio = ext_kind(os.path.splitext(path)[1]) == "audio"
+        audio_rate = min(96, max(24, int(total*.2)))
+        if audio:
+            if total < 24:
+                raise ValueError("Taille cible trop petite pour cette durée.")
+            # MP3 CBR accepts a discrete set of bitrates.
+            if self._compression_ext(path, params) == "mp3":
+                audio_rate = max(rate for rate in (24,32,40,48,56,64,80,96,112,128,160,192,224,256,320) if rate <= total)
+            else:
+                audio_rate = min(320, total)
+            return {"audio_kbps": audio_rate}
+        if total - audio_rate < 48:
+            raise ValueError("Taille cible trop petite pour une vidéo lisible à cette durée.")
+        return {"video_kbps": total-audio_rate, "audio_kbps": audio_rate}
+
+    def _smart_command(self, ff, path, out, p, start=None, duration=None, encoder=None):
+        profile = p.get("profile", "compact")
+        heights = {"compact": 720, "quality": 1080, "compatible": 720}
+        if profile not in heights:
+            raise ValueError("Profil de compression invalide")
+        height = heights[profile]
+        compact = profile == "compact"
+        output_format = self._compression_ext(path, p)
+        bitrate = int(p.get("video_kbps", 0))
+        audio_bitrate = int(p.get("audio_kbps", 80 if compact else 96))
+        encoder = encoder or "libx264"
+        cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-filter_threads", "4"]
+        if encoder == "av1_qsv":
+            cmd += ["-init_hw_device", "d3d11va=intel:,vendor_id=0x8086",
+                    "-init_hw_device", "qsv=qs@intel", "-filter_hw_device", "qs"]
+        if start is not None:
+            cmd += ["-ss", str(start)]
+        cmd += ["-threads", "6", "-i", path]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
         if ext_kind(os.path.splitext(path)[1]) == "audio":
             cmd += ["-map", "0:a:0", "-vn"]
         else:
-            cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c:v",
-                    "libx265" if codec == "h265" else "libx264", "-preset", speed,
-                    "-b:v", f"{vb}k", "-maxrate", f"{vb * 2}k", "-bufsize", f"{vb * 2}k", "-pix_fmt", "yuv420p"]
-            vf = f"scale=-2:trunc(min(ih\\,{height})/2)*2" if height else "scale=trunc(iw/2)*2:trunc(ih/2)*2"
-            cmd += ["-vf", vf]
-            if codec == "h265": cmd += ["-tag:v", "hvc1"]
-        return cmd + ["-c:a", "aac", "-b:a", f"{ab}k", "-ac", "2", "-map_metadata", "0", "-movflags", "+faststart", out]
+            cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+            width = height * 16 // 9
+            size = f"scale=w='min(iw,{width})':h='min(ih,{height})':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos"
+            vf = f"{size},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+            cmd += ["-vf", vf + (",format=nv12" if encoder == "av1_qsv" else ",format=yuv420p"), "-c:v", encoder]
+            if bitrate:
+                cmd += ["-b:v", f"{bitrate}k", "-maxrate", f"{max(bitrate+1, round(bitrate*1.25))}k",
+                        "-bufsize", f"{bitrate*2}k"]
+                if encoder == "av1_qsv":
+                    cmd += ["-preset", "fast"]
+                elif encoder == "av1_nvenc":
+                    cmd += ["-preset", "p5", "-rc", "vbr"]
+                elif encoder == "libsvtav1":
+                    cmd += ["-preset", "9"]
+                else:
+                    cmd += ["-preset", "fast"]
+            elif encoder == "av1_qsv":
+                cmd += ["-preset", "fast", "-global_quality", "30" if compact else "27"]
+            elif encoder == "av1_nvenc":
+                cmd += ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "35" if compact else "30", "-b:v", "0"]
+            elif encoder == "libsvtav1":
+                cmd += ["-preset", "9", "-crf", "32" if compact else "28"]
+            else:
+                cmd += ["-preset", "fast", "-crf", "23"]
+        audio_codec = {"mp3": "libmp3lame", "webm": "libopus"}.get(output_format, "aac")
+        metadata = ["-map_metadata", "0"] if self.cfg.get("keep_metadata", True) else ["-map_metadata", "-1"]
+        faststart = ["-movflags", "+faststart"] if output_format in ("m4a", "mp4") else []
+        return cmd + ["-c:a", audio_codec, "-b:a", f"{audio_bitrate}k"] + metadata + faststart + [out]
 
-    def _smart_export(self, ff, tool, path, p, opts):
+    def _encode_smart(self, ff, path, out, params, start=None, duration=None):
+        encoder = params.get("encoder", "auto")
+        if params.get("profile") == "compatible" or ext_kind(os.path.splitext(path)[1]) == "audio":
+            choices = ["libx264"]
+        else:
+            choices = {"auto": ["av1_qsv", "av1_nvenc", "libsvtav1"],
+                       "intel": ["av1_qsv"], "nvidia": ["av1_nvenc"], "cpu": ["libsvtav1"]}.get(encoder)
+        if not choices:
+            raise ValueError("Encodeur invalide")
+        error = ""
+        for candidate in choices:
+            if self._stop.is_set():
+                return -1, "Annulé", candidate
+            rc, error = self._run_ff(self._smart_command(ff, path, out, params, start, duration, candidate),
+                                     timeout=180 if duration else None)
+            if not rc:
+                return rc, "", candidate
+            self._log(f"Échec avec {candidate} : {error.splitlines()[-1] if error else 'FFmpeg'}", "warn")
+        return rc, error, candidate
+
+    def _smart_export(self, ff, path, p, opts):
         kind = ext_kind(os.path.splitext(path)[1])
         if kind not in ("video", "audio"): return False, "Sélectionne une vidéo ou un fichier audio"
-        if tool == "unusual_mp4" and os.path.splitext(path)[1].lower() not in {".ts", ".m3u8", ".m4s", ".mts", ".m2ts"}:
-            return True, os.path.basename(path) + " — format non concerné, ignoré"
-        ext = "m4a" if kind == "audio" else "mp4"
-        dst = self._tool_out(path, ext, opts, "_compressed" if tool == "smart_compress" else "_mp4")
+        ext = self._compression_ext(path, p)
+        dst = self._tool_out(path, ext, opts, "_compressed")
+        target = float(p.get("target_mb") or 0)
+        params = dict(p)
+        if target:
+            params.update(self._compression_budget(path, p, self.media_info(path).get("duration", 0)))
         base, n = os.path.splitext(dst)[0], 1
         while True:
             try:
@@ -1215,67 +1363,179 @@ class Api:
         try:
             fd, tmp = tempfile.mkstemp(prefix="_CONVTMP", suffix="." + ext, dir=os.path.dirname(dst)); os.close(fd)
             if self._stop.is_set(): return False, "Annulé"
+            started = time.perf_counter()
             self._log("Traitement : " + os.path.basename(path))
-            if tool == "unusual_mp4":
-                cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", tmp]
-                rc, err = self._run_ff(cmd)
-                if rc and not self._stop.is_set():
-                    self._log("Copie incompatible : ré-encodage H.264/AAC", "warn")
-                    cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-i", path,
-                           "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-                           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", tmp]
-                    rc, err = self._run_ff(cmd)
-            else: rc, err = self._run_ff(self._smart_command(ff, path, tmp, p))
+            rc, err, encoder = self._encode_smart(ff, path, tmp, params)
+            if not rc and target and params.get("video_kbps") and os.path.getsize(tmp) > target*1_000_000:
+                actual = os.path.getsize(tmp)
+                params["video_kbps"] = max(48, int(params["video_kbps"] * target*1_000_000/actual * .95))
+                self._log("Ajustement du débit pour approcher la taille cible")
+                rc, err, encoder = self._encode_smart(ff, path, tmp, params)
+            if not rc:
+                self._log(f"Encodeur utilisé : {encoder}")
             if self._stop.is_set(): return False, "Annulé : " + os.path.basename(path)
             if rc or not os.path.getsize(tmp):
                 return False, os.path.basename(path) + " — " + err[-1200:] + (" — Un segment M4S isolé peut nécessiter sa playlist et son fichier d’initialisation." if path.lower().endswith(".m4s") else "")
             before, after = os.path.getsize(path), os.path.getsize(tmp)
-            if tool == "smart_compress" and p.get("only_smaller", True) and after >= before:
+            if p.get("only_smaller", True) and after >= before:
                 return True, os.path.basename(path) + " — aucun gain, original conservé sans nouvelle copie"
             os.replace(tmp, dst); saved = True
-            return True, f"{os.path.basename(dst)} — {human(before)} → {human(after)} (gain {100 * (1-after/max(1,before)):.1f} %)"
+            if target and after > target*1_000_000:
+                self._log(f"Taille cible dépassée : {human(after)}", "warn")
+            return True, f"{os.path.basename(dst)} — {human(before)} → {human(after)} (gain {100 * (1-after/max(1,before)):.1f} %) · {time.strftime('%H:%M:%S', time.gmtime(time.perf_counter()-started))}"
         finally:
             if tmp and os.path.exists(tmp): os.remove(tmp)
             if not saved and os.path.exists(dst): os.remove(dst)
 
-    def smart_preview(self, path, params):
+    @staticmethod
+    def _data_url(path, mime):
+        return f"data:{mime};base64," + base64.b64encode(Path(path).read_bytes()).decode("ascii")
+
+    def _preview_clip(self, ff, path, target, at=0, filters=""):
+        chain = ",".join(filter(None, (filters,
+            "scale=w='min(iw,960)':h='min(ih,540)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "format=yuv420p")))
+        rc, err = self._run_ff([ff, "-v", "error", "-y", "-ss", str(at), "-i", path, "-t", "5",
+            "-map", "0:v:0", "-map", "0:a:0?", "-vf", chain, "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "18", "-c:a", "aac", "-movflags", "+faststart", target], timeout=60)
+        if rc or not os.path.getsize(target):
+            raise ValueError(err[-650:] or "Aperçu vide")
+        return self._data_url(target, "video/mp4")
+
+    def smart_estimate(self, path, params):
         with self._lock:
-            if self._running: return {"ok": False, "err": "Un traitement est déjà en cours"}
+            if self._running:
+                return {"ok": False, "err": "Un traitement est déjà en cours"}
             self._running = True
             self._stop.clear()
         try:
             ff = self._need_ff()
-            if not ff: raise ValueError("FFmpeg non configuré")
-            if ext_kind(os.path.splitext(path)[1]) not in ("audio", "video"): raise ValueError("Sélectionne une vidéo ou un fichier audio")
+            if not ff:
+                raise ValueError("FFmpeg non configuré")
+            info = self.media_info(path)
+            length = info.get("duration", 0)
+            if length <= 0:
+                raise ValueError("Durée inconnue : vérifie le fichier avec FFprobe.")
+            params = dict(params)
+            params.update(self._compression_budget(path, params, length))
+            ext = self._compression_ext(path, params)
+            clips = [(0, length)] if length <= 24 else [(length * f, min(12, length * .12)) for f in (.15, .5, .82)]
+            seconds = total_bytes = elapsed = 0
+            used = None
+            choices = {"av1_qsv": "intel", "av1_nvenc": "nvidia", "libsvtav1": "cpu"}
+            with tempfile.TemporaryDirectory(prefix="mtk-estimate-") as td:
+                out = os.path.join(td, "test." + ext)
+                for start, duration in clips:
+                    settings = dict(params, encoder=choices.get(used, params.get("encoder", "auto")))
+                    began = time.perf_counter()
+                    rc, error, used = self._encode_smart(ff, path, out, settings, start, duration)
+                    elapsed += time.perf_counter() - began
+                    if rc or self._stop.is_set():
+                        raise ValueError("Estimation annulée" if self._stop.is_set() else error[-650:])
+                    sample = self.media_info(out).get("duration", 0)
+                    if sample <= 0:
+                        raise ValueError("Extrait vide")
+                    seconds += sample
+                    total_bytes += os.path.getsize(out)
+            return {"ok": True, "duration": elapsed * length / seconds,
+                    "size": human(round(total_bytes * length / seconds)), "source_size": info.get("size"),
+                    "encoder": used, "samples": len(clips)}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "err": str(exc)}
+        finally:
+            self._running = False
+
+    def smart_preview(self, path, params):
+        with self._lock:
+            if self._running:
+                return {"ok": False, "err": "Un traitement est déjà en cours"}
+            self._running = True
+            self._stop.clear()
+        try:
+            ff = self._need_ff()
+            if not ff:
+                raise ValueError("FFmpeg non configuré")
             at = float(params.get("at", 0))
-            if not 0 <= at <= 864000: raise ValueError("Position d’aperçu invalide")
             audio_only = ext_kind(os.path.splitext(path)[1]) == "audio"
-            with tempfile.TemporaryDirectory(prefix="mediatoolkit-preview-") as td:
-                out = os.path.join(td, "preview.m4a" if audio_only else "preview.mp4")
-                rc, err = self._run_ff(self._smart_command(ff, path, out, params, at, 5), timeout=180)
-                if self._stop.is_set(): raise ValueError("Aperçu annulé")
-                if rc: raise ValueError(err[-1200:])
-                info = probe(self.cfg.get("ffprobe", ""), out)
-                dur = float(info.get("format", {}).get("duration", 0) or 0)
-                if dur <= 0: raise ValueError("Extrait vide ou ffprobe absent : choisis une position dans le média")
-                size = os.path.getsize(out)
-                if size > 64 * 1024 * 1024: raise ValueError("Aperçu trop volumineux : réduis le débit")
-                mime = "audio/mp4" if audio_only else "video/mp4"
-                with open(out, "rb") as f: data = base64.b64encode(f.read()).decode("ascii")
-                result = {"ok": True, "url": f"data:{mime};base64,{data}", "size": human(size), "duration": dur}
-                if not audio_only:
-                    for key, source, seek in (("before", path, at), ("after", out, 0)):
-                        jpg = os.path.join(td, key + ".jpg")
-                        rc, err = self._run_ff([ff, "-loglevel", "error", "-y", "-ss", str(seek), "-i", source, "-frames:v", "1", "-vf", "scale=800:-2", jpg], timeout=30)
-                        if rc == 0 and os.path.isfile(jpg):
-                            with open(jpg, "rb") as f: result[key] = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode("ascii")
+            if not 0 <= at <= 864000:
+                raise ValueError("Position d’aperçu invalide")
+            with tempfile.TemporaryDirectory(prefix="mtk-preview-") as td:
+                params = dict(params)
+                if params.get("target_mb"):
+                    params.update(self._compression_budget(path, params, self.media_info(path).get("duration", 0)))
+                ext = self._compression_ext(path, params)
+                out = os.path.join(td, "rendu." + ext)
+                rc, err, encoder = self._encode_smart(ff, path, out, params, at, 5)
+                if rc or not os.path.getsize(out):
+                    raise ValueError(err[-850:] or "Aperçu vide")
+                result = {"ok": True, "size": human(os.path.getsize(out)), "encoder": encoder,
+                          "audio": audio_only}
+                if audio_only:
+                    result["after"] = self._data_url(out, "audio/mpeg" if ext == "mp3" else "audio/mp4")
+                else:
+                    result["before"] = self._preview_clip(ff, path, os.path.join(td, "avant.mp4"), at)
+                    result["after"] = self._preview_clip(ff, out, os.path.join(td, "apres.mp4"))
                 return result
-        except Exception as e: return {"ok": False, "err": str(e)}
-        finally: self._running = False
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "err": str(exc)}
+        finally:
+            self._running = False
+
+    def edit_preview(self, path, job, at=0):
+        ff = self._need_ff()
+        if not ff:
+            return {"ok": False, "err": "FFmpeg non configuré"}
+        with self._lock:
+            if self._running:
+                return {"ok": False, "err": "Un traitement est déjà en cours"}
+            self._running = True
+            self._stop.clear()
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            kind = ext_kind(ext)
+            if kind == "image":
+                return self.preview(path, job.get("color"), job.get("resize"), 960, 0, job)
+            if kind != "video":
+                return {"ok": False, "err": "Choisis une image ou une vidéo"}
+            with tempfile.TemporaryDirectory(prefix="mtk-edit-") as td:
+                extract = os.path.join(td, "media" + ext)
+                rc, error = self._run_ff([ff, "-v", "error", "-y", "-ss", str(max(0, float(at))), "-i", path,
+                    "-t", "5", "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                    "-f", "matroska", extract], timeout=90)
+                if rc or not os.path.isfile(extract):
+                    raise ValueError(error[-650:] or "Position hors de la vidéo ou aperçu annulé")
+                opts = dict(DEFAULTS, overwrite_mode="suffix", suffix="_preview")
+                status, message = self._one(extract, dict(job, mode="combo"), opts, ff, list_encoders(ff), False)
+                if status == "err":
+                    raise ValueError(message)
+                target = job.get("targets", {}).get("video") or ext.lstrip(".")
+                rendered = os.path.join(td, "media_preview." + target) if status == "ok" else extract
+                if not os.path.isfile(rendered):
+                    raise ValueError("Aperçu annulé ou sortie indisponible")
+                before = self._preview_clip(ff, extract, os.path.join(td, "avant.mp4"))
+                after = self._preview_clip(ff, rendered, os.path.join(td, "apres.mp4")) if status == "ok" else before
+                return {"ok": True, "kind": "video", "before": before, "after": after,
+                        "size": human(os.path.getsize(rendered)) if status == "ok" else ""}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "err": str(exc)}
+        finally:
+            self._running = False
+
+    def montage_preview(self, path, start="0"):
+        ff = self._need_ff()
+        if not ff:
+            return {"ok": False, "err": "FFmpeg non configuré"}
+        if ext_kind(os.path.splitext(path)[1]) != "video":
+            return {"ok": False, "err": "Sélectionne une vidéo."}
+        try:
+            with tempfile.TemporaryDirectory(prefix="mtk-montage-") as td:
+                return {"ok": True, "before": self._preview_clip(ff, path, os.path.join(td, "extrait.mp4"), str(start or "0"))}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "err": str(exc)}
 
     def _tool_one(self, ff, tool, path, p, opts, enc):
-        if tool in ("smart_compress", "unusual_mp4"):
-            return self._smart_export(ff, tool, path, p, opts)
+        if tool == "smart_compress":
+            return self._smart_export(ff, path, p, opts)
         name = os.path.basename(path)
         ext = os.path.splitext(path)[1].lower()
         kind = ext_kind(ext)
@@ -1299,23 +1559,17 @@ class Api:
             cmd = [ff, "-y", "-hide_banner", "-loglevel", "error"]
             if ss and ss != "0": cmd += ["-ss", ss]
             cmd += ["-i", path]
-            if to: cmd += ["-to", str(float(to) - (float(ss) if ss.replace('.','',1).isdigit() else 0)) if False else to]
+            if to:
+                def seconds(value):
+                    total = 0.0
+                    for field in value.split(":"):
+                        total = total*60 + float(field.replace(",", "."))
+                    return total
+                duration = seconds(to) - seconds(ss or "0")
+                if duration <= 0:
+                    return False, "La fin doit être après le début."
+                cmd += ["-t", str(duration)]
             cmd += (["-c", "copy"] if g("lossless", True) else []) + ["-map_metadata", "0", out]
-
-        elif tool == "speed":
-            f = float(g("factor", 1.5))
-            out = self._tool_out(path, ext.lstrip("."), opts, f"_x{f:g}")
-            # atempo accepte 0.5–2.0 : on chaîne pour les valeurs extrêmes
-            at, r = [], f
-            while r > 2.0: at.append("atempo=2.0"); r /= 2.0
-            while r < 0.5: at.append("atempo=0.5"); r /= 0.5
-            at.append(f"atempo={r:.4f}")
-            if kind == "video":
-                cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", path,
-                       "-filter_complex", f"[0:v]setpts=PTS/{f}[v];[0:a]{','.join(at)}[a]",
-                       "-map", "[v]", "-map", "[a]", out]
-            else:
-                cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", path, "-af", ",".join(at), out]
 
         elif tool == "gif":
             w = int(g("width", 480)); fps = int(g("fps", 15))
@@ -1374,28 +1628,6 @@ class Api:
                 va, _ = video_codec_args("h264", 85, 4, False, enc)
                 cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", path, "-vf", vf] + (va or []) + ["-c:a", "copy", out]
 
-        elif tool == "compress_target":
-            mb = float(g("size_mb", 25))
-            fp = self.cfg.get("ffprobe", "")
-            d = probe(fp, path) if fp else {}
-            dur = float(d.get("format", {}).get("duration", 0) or 0)
-            if dur <= 0: return False, f"{name} (durée inconnue)"
-            abr = 128
-            vbr = max(50, int((mb * 8192) / dur - abr))     # kbit/s
-            out = self._tool_out(path, "mp4", opts, f"_{int(mb)}MB")
-            base_cmd = [ff, "-y", "-hide_banner", "-loglevel", "error"]
-            tmpdir = tempfile.mkdtemp(prefix="mtk_")
-            passlog = os.path.join(tmpdir, "pl")
-            c1 = base_cmd + ["-i", path, "-c:v", "libx264", "-b:v", f"{vbr}k", "-pass", "1", "-passlogfile", passlog,
-                             "-an", "-f", "mp4", os.devnull]
-            rc, err = self._run_ff(c1)
-            if rc != 0: shutil.rmtree(tmpdir, True); return False, f"{name} — passe 1 : {err[-120:]}"
-            cmd = base_cmd + ["-i", path, "-c:v", "libx264", "-b:v", f"{vbr}k", "-pass", "2", "-passlogfile", passlog,
-                              "-c:a", "aac", "-b:a", f"{abr}k", "-movflags", "+faststart", out]
-            rc, err = self._run_ff(cmd)
-            shutil.rmtree(tmpdir, True)
-            if rc != 0: return False, f"{name} — {err[-120:]}"
-            return True, f"{os.path.basename(out)}  ({human(os.path.getsize(out))})"
 
         else:
             return False, f"outil inconnu : {tool}"
@@ -1587,20 +1819,25 @@ summary:hover{color:var(--fg)}
 .tool .ic{font-size:22px}.tool b{display:block;margin-top:6px;font-size:13.5px}.tool small{color:var(--fg3);font-size:11.5px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;place-items:center;z-index:99;backdrop-filter:blur(3px)}
 .modal.on{display:grid}.modal .box{background:var(--card);border:1px solid var(--line2);border-radius:14px;padding:22px;max-width:520px;width:90%}
+ [hidden]{display:none!important}
+ #toolGrid h4{margin:16px 0 8px;color:var(--fg2)}
+ .compare{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+ .compare figure{margin:0;min-width:0}
+ .compare figcaption{font-size:12px;color:var(--fg2);margin-bottom:6px}
+ .compare :is(img,video,audio){display:block;width:100%;max-height:380px;object-fit:contain;border-radius:8px;background:var(--bg2)}
+ .compare img{background-color:#20232a;background-image:conic-gradient(#30343d 25%,transparent 0 50%,#30343d 0 75%,transparent 0);background-size:16px 16px}
+ @media(max-width:1050px){.compare{grid-template-columns:1fr}}
 </style></head>
 <body>
 <div id="app">
 <aside id="side">
-  <div class="brand"><div class="logo">M</div><div><b>Media Toolkit</b><small>v3 · pywebview</small></div></div>
+  <div class="brand"><div class="logo">M</div><div><b>Media Toolkit</b><small>Vidéo, image et audio</small></div></div>
   <nav>
     <div class="grp">Traiter</div>
-    <button data-p="convert" class="on"><span class="ic">⇄</span>Convertir</button>
-    <button data-p="compress"><span class="ic">📦</span>SmartCompress</button>
-    <button data-p="color"><span class="ic">◐</span>Couleurs</button>
-    <button data-p="resize"><span class="ic">⤢</span>Redimensionner</button>
-    <button data-p="combo"><span class="ic">✦</span>Tout-en-un</button>
+    <button data-p="compress" class="on"><span class="ic">📦</span>Compresser</button>
+    <button data-p="convert"><span class="ic">⇄</span>Convertir et ajuster</button>
     <div class="grp">Avancé</div>
-    <button data-p="tools"><span class="ic">🛠</span>Outils</button>
+    <button data-p="tools"><span class="ic">✂</span>Montage rapide</button>
     <button data-p="info"><span class="ic">ⓘ</span>Analyser</button>
     <div class="grp">Système</div>
     <button data-p="settings"><span class="ic">⚙</span>Paramètres</button>
@@ -1612,24 +1849,32 @@ summary:hover{color:var(--fg)}
 </aside>
 
 <main>
-<section class="page" id="p-compress">
-<h1>SmartCompress</h1><p class="hint">Réduis le poids des vidéos et fichiers audio pour les sauvegarder. Chaque export garde l’original.</p>
-<div data-src></div><div class="card"><h3>Compression</h3>
-<div class="row"><label>Codec vidéo</label><select id="scCodec"><option value="h264">H.264 — compatible</option><option value="h265">H.265 — efficace, plus lent</option></select></div>
-<div class="row"><label>Débit vidéo (kbit/s)</label><input id="scVideo" type="number" min="50" max="100000" value="1000"></div>
-<div class="row"><label>Débit audio (kbit/s)</label><input id="scAudio" type="number" min="16" max="320" value="96"></div>
-<div class="row"><label>Hauteur maximale</label><select id="scHeight"><option value="0">Résolution originale</option><option>360</option><option>480</option><option selected>720</option><option>1080</option></select></div>
-<div class="row"><label>Encodage</label><select id="scPreset"><option value="fast">Rapide</option><option value="medium" selected>Équilibré</option><option value="slow">Lent — meilleure efficacité</option></select></div>
-<label><input type="checkbox" id="scSmaller" checked> Sauvegarder uniquement si le résultat est plus petit</label>
-<p class="hint">Un débit plus bas réduit le poids et la qualité. Audio AAC stéréo ; première piste vidéo et première piste audio. La taille finale dépend du contenu.</p>
-<div id="scEstimate" class="hint"></div></div>
-<div class="card"><h3>Aperçu réel avant de sauvegarder</h3>
-<div class="row"><label>Début (secondes)</label><input id="scAt" type="number" min="0" value="0"><button class="btn" id="scPreview">Tester 5 secondes</button><button class="btn" id="scCancel" disabled>Annuler l’aperçu</button></div>
-<p id="scStatus" class="hint">Sélectionne un fichier dans la liste, puis teste tes réglages.</p>
-<video id="scPlayer" controls style="display:none;width:100%;max-height:340px"></video>
-<div style="display:flex;gap:12px"><figure style="margin:0;width:50%"><figcaption>Original</figcaption><img id="scBefore" style="width:100%"></figure><figure style="margin:0;width:50%"><figcaption>Compressé</figcaption><img id="scAfter" style="width:100%"></figure></div>
-<p class="hint">La lecture H.265 dépend des codecs Windows. Les images avant/après montrent aussi le résultat. Les exports portent le suffixe _compressed, dans le dossier source ou le sous-dossier choisi dans Paramètres.</p></div>
-<div data-run></div></section>
+<section class="page on" id="p-compress">
+<h1>Compresser</h1><p class="hint">Choisis le format final et le poids souhaité, puis teste un extrait.</p>
+<div class="split"><div>
+<div data-src></div>
+<div class="card"><h3>Sortie</h3>
+<div class="row" id="scVideoFormatRow"><label for="scFormat">Format final</label><select id="scFormat" class="grow">
+<option value="mp4">MP4</option><option value="mkv">MKV</option><option value="webm">WebM</option>
+</select></div>
+<div class="row" id="scAudioFormatRow" hidden><label for="scAudioFormat">Format audio</label><select id="scAudioFormat" class="grow">
+<option value="m4a">M4A · AAC</option><option value="mp3">MP3</option></select></div>
+<div class="row"><label for="scSizeMode">Taille</label><select id="scSizeMode" class="grow"><option value="auto">Auto · selon la qualité</option><option value="target">Taille cible</option></select></div>
+<div class="row" id="scTargetRow" hidden><label for="scTarget">Taille cible</label><input id="scTarget" type="number" required min="0.1" max="100000" step="0.1" value="500"><span>Mo par fichier</span></div>
+<div class="row" id="scProfileRow"><label for="scProfile">Profil vidéo</label><select id="scProfile" class="grow">
+<option value="compact">720p compact · AV1</option><option value="quality">1080p qualité · AV1</option><option value="compatible">720p compatible · H.264</option>
+</select></div>
+<p id="scSourceInfo" class="hint"></p>
+<div class="row"><button class="btn sm" id="scEstimateButton">Estimer le temps et le poids</button><button class="btn sm" id="scEstimateStop" hidden>Annuler</button></div>
+<p id="scEstimate" class="hint" aria-live="polite">L’estimation encode quelques extraits avec les réglages choisis.</p>
+<div class="row" id="scEncoderRow">
+<label for="scEncoder">Carte / encodeur</label><select id="scEncoder" class="grow"><option value="auto">Auto · Intel, NVIDIA, puis CPU</option>
+<option value="intel">Intel Arc · Quick Sync</option><option value="nvidia">NVIDIA · NVENC</option><option value="cpu">CPU · SVT-AV1</option></select></div>
+</div><div data-run></div></div>
+<div class="pv"><div class="card"><h3>Aperçu avant / après</h3>
+<div class="row"><label for="scAt">Début (s)</label><input id="scAt" type="number" min="0" value="0"><button class="btn" id="scPreview">Tester 5 s</button><button class="btn sm" id="scCancel" disabled>Annuler</button></div>
+<p id="scStatus" class="hint">Sélectionne une vidéo ou un fichier audio.</p><div id="scCompare" class="compare"></div>
+</div></div></div></section>
 <!-- ══════════ SOURCE PARTAGÉE ══════════ -->
 <template id="srcTpl">
   <div class="card">
@@ -1662,15 +1907,16 @@ summary:hover{color:var(--fg)}
 </template>
 
 <!-- ══════════ CONVERTIR ══════════ -->
-<section class="page on" id="p-convert">
-  <h1>Convertir</h1><div class="sub">Plus de 100 formats vidéo, image et audio. Choisis un format cible par type de média.</div>
+<section class="page" id="p-convert">
+  <h1>Convertir et ajuster</h1><div class="sub">Choisis le format de sortie, la taille et les couleurs en une seule étape.</div>
   <div class="split"><div>
     <div data-src></div>
     <div class="card"><h3>Formats cibles</h3>
       <div class="row"><label>Vidéo →</label><select id="cvV" class="grow"></select></div>
       <div class="row"><label>Image →</label><select id="cvI" class="grow"></select></div>
       <div class="row"><label>Audio →</label><select id="cvA" class="grow"></select></div>
-      <div class="hint">« Ne pas convertir » laisse ce type de média intact.</div>
+      <div class="hint">« Même format » garde le format actuel et applique les ajustements éventuels.</div>
+      <label class="swrow"><input type="checkbox" id="cvAllFormats"> Afficher les formats avancés</label>
     </div>
     <div class="card"><h3>Qualité</h3>
       <div class="sl"><label>Qualité</label><input type="range" id="cvQ" min="0" max="100" value="90"><output id="cvQo">90</output><span></span></div>
@@ -1679,105 +1925,36 @@ summary:hover{color:var(--fg)}
         <div class="row"><label>Codec vidéo</label><select id="cvVC" class="grow"></select></div>
         <div class="row"><label>Codec audio</label><select id="cvAC" class="grow"></select></div>
         <div class="row"><label>Débit audio</label><select id="cvAB"><option>96</option><option>128</option><option>192</option><option selected>256</option><option>320</option><option>512</option></select><span class="hint">kbit/s</span></div>
-        <div class="sl"><label>Vitesse encodage</label><input type="range" id="cvSP" min="0" max="8" value="4"><output id="cvSPo">4</output><span></span></div>
-        <div class="hint">0 = très rapide (gros fichier) · 8 = très lent (fichier compact)</div>
       </details>
     </div>
+    <div class="card"><details><summary>Redimensionner ou régler les couleurs</summary>
+      <div class="row"><label for="cvHeight">Hauteur max.</label><select id="cvHeight">
+        <option value="0">Originale</option><option>480</option><option>720</option><option>1080</option><option>1440</option><option>2160</option>
+      </select></div>
+      <div id="colSliders"></div><button id="colReset" class="btn sm">Réinitialiser les couleurs</button>
+    </details></div>
     <div data-run></div>
   </div>
-  <div><div class="card"><h3>Ce qui sera fait</h3><div id="cvSummary" class="selectable"></div></div>
-    <div class="card"><h3>Formats reconnus en entrée</h3><div class="hint" id="cvSrcInfo"></div></div></div></div>
-</section>
-
-<!-- ══════════ COULEURS ══════════ -->
-<section class="page" id="p-color">
-  <h1>Couleurs</h1><div class="sub">Règle avec un aperçu en direct, puis applique à tout un dossier en un clic.</div>
-  <div class="split"><div>
-    <div data-src></div>
-    <div class="card"><h3>Réglages</h3>
-      <div id="colSliders"></div>
-      <div class="chips" style="margin:12px 0 6px" id="colPresets"></div>
-      <div class="swrow"><span class="sw"><input type="checkbox" id="colGray"><span></span></span><b>Noir & blanc</b>
-        <span class="sw" style="margin-left:16px"><input type="checkbox" id="colSepia"><span></span></span><b>Sépia</b>
-        <span class="sw" style="margin-left:16px"><input type="checkbox" id="colInv"><span></span></span><b>Négatif</b></div>
-      <button class="btn sm" id="colReset">↺ Tout réinitialiser</button>
-    </div>
-    <div class="card"><h3>Sortie</h3>
-      <div class="row"><label>Format image</label><select id="colFmt" class="grow"></select></div>
-      <div class="swrow"><span class="sw"><input type="checkbox" id="colVid"><span></span></span><b>Appliquer aussi aux vidéos</b> <span class="hint">(ré-encodage)</span></div>
-    </div>
-    <div data-run></div>
-  </div>
-  <div class="pv">
-    <div class="card"><h3>Aperçu avant / après</h3>
-      <div class="vmodes"><button class="chip on" data-vm="split">Séparé</button><button class="chip" data-vm="after">Après</button><button class="chip" data-vm="before">Avant</button></div>
-      <div class="stage" id="colStage"><div class="empty">Sélectionne un fichier dans la liste<br>pour voir l'aperçu</div><div class="spin">Calcul…</div></div>
-      <div class="dims" id="colDims"></div>
-      <div class="hint" style="text-align:center;margin-top:8px">L'aperçu utilise les <b>mêmes filtres FFmpeg</b> que le rendu final.</div>
-    </div>
-  </div></div>
-</section>
-
-<!-- ══════════ REDIMENSIONNER ══════════ -->
-<section class="page" id="p-resize">
-  <h1>Redimensionner</h1><div class="sub">Agrandis ou réduis, de minuscule à géant. Aperçu de la taille finale en direct.</div>
-  <div class="split"><div>
-    <div data-src></div>
-    <div class="card"><h3>Mode</h3>
-      <div class="chips" id="rzModes"></div>
-      <div id="rzInputs" style="margin-top:14px"></div>
-      <div class="row"><label>Autoriser</label><div class="chips" id="rzAllow"></div></div>
-      <div class="hint" id="rzAllowH"></div>
-    </div>
-    <div class="card"><h3>Qualité de mise à l'échelle</h3>
-      <div class="row"><label>Algorithme</label><select id="rzAlgo" class="grow">
-        <option value="lanczos">Lanczos — le plus net (recommandé)</option>
-        <option value="bicubic">Bicubique — équilibré</option>
-        <option value="bilinear">Bilinéaire — doux</option>
-        <option value="neighbor">Plus proche voisin — pixel art</option>
-        <option value="spline">Spline — très lisse</option>
-        <option value="area">Area — idéal pour réduire</option></select></div>
-      <div class="swrow"><span class="sw"><input type="checkbox" id="rzEven"><span></span></span><b>Dimensions paires</b> <span class="hint">(requis pour certaines vidéos)</span></div>
-      <div class="row"><label>Format sortie</label><select id="rzFmt" class="grow"></select></div>
-      <div class="swrow"><span class="sw"><input type="checkbox" id="rzVid"><span></span></span><b>Appliquer aussi aux vidéos</b></div>
-    </div>
-    <div data-run></div>
-  </div>
-  <div class="pv">
-    <div class="card"><h3>Aperçu</h3>
-      <div class="vmodes"><button class="chip on" data-vm="split">Séparé</button><button class="chip" data-vm="after">Après</button><button class="chip" data-vm="before">Avant</button></div>
-      <div class="stage" id="rzStage"><div class="empty">Sélectionne un fichier dans la liste<br>pour voir l'aperçu</div><div class="spin">Calcul…</div></div>
-      <div class="dims" id="rzDims"></div>
-      <div class="card" style="margin:14px 0 0;background:var(--bg2)"><h3>Présélections rapides</h3><div class="chips" id="rzPresets"></div></div>
-    </div>
-  </div></div>
-</section>
-
-<!-- ══════════ TOUT-EN-UN ══════════ -->
-<section class="page" id="p-combo">
-  <h1>Tout-en-un</h1><div class="sub">Convertir + redimensionner + couleurs en une seule passe (une seule ré-encodage = pas de perte cumulée).</div>
-  <div class="split"><div>
-    <div data-src></div>
-    <div class="card"><h3>Étapes à inclure</h3>
-      <div class="swrow"><span class="sw"><input type="checkbox" id="cbRz" checked><span></span></span><b>Redimensionner</b> <span class="hint">(réglages de l'onglet Redimensionner)</span></div>
-      <div class="swrow"><span class="sw"><input type="checkbox" id="cbCol" checked><span></span></span><b>Couleurs</b> <span class="hint">(réglages de l'onglet Couleurs)</span></div>
-      <div class="swrow"><span class="sw"><input type="checkbox" id="cbCv" checked><span></span></span><b>Convertir</b> <span class="hint">(formats de l'onglet Convertir)</span></div>
-      <div class="callout" style="margin-top:12px">Règle chaque étape dans son onglet, puis reviens ici pour tout lancer d'un coup.</div>
-    </div>
-    <div data-run></div>
-  </div>
-  <div><div class="card"><h3>Récapitulatif</h3><div id="cbSummary" class="selectable"></div></div></div></div>
+  <div><div class="card"><h3>Aperçu avant / après</h3>
+    <div class="row"><label for="cvAt">Début vidéo (s)</label><input id="cvAt" min="0" type="number" value="0"><button class="btn" id="cvPreview">Voir l’aperçu</button></div>
+    <p id="cvStatus" class="hint">Sélectionne une image ou une vidéo.</p><div id="cvCompare" class="compare"></div>
+    </div><div class="card"><h3>Ce qui sera fait</h3><div id="cvSummary" class="selectable"></div></div>
+    </div></div>
 </section>
 
 <!-- ══════════ OUTILS ══════════ -->
 <section class="page" id="p-tools">
-  <h1>Outils</h1><div class="sub">Couper, extraire, accélérer, compresser à une taille précise…</div>
+  <h1>Montage rapide</h1><div class="sub">Coupe, assemble, recadre l’orientation ou travaille le son.</div>
   <div class="split"><div>
     <div data-src></div>
-    <div class="card"><h3>Choisis un outil</h3><div class="tools" id="toolGrid"></div></div>
+    <div class="card"><h3>Choisis un outil</h3><div id="toolGrid"></div></div>
   </div>
   <div>
     <div class="card"><h3 id="toolTitle">Paramètres</h3><div id="toolParams" class="hint">Choisis un outil à gauche.</div></div>
+    <div class="card" id="toolPreviewCard" hidden><h3>Vérifier le début</h3>
+      <button class="btn sm" id="toolPreview">Lire 5 s à partir du début choisi</button>
+      <p id="toolPreviewStatus" class="hint"></p><div id="toolCompare" class="compare"></div>
+    </div>
     <div data-run></div>
   </div></div>
 </section>
@@ -1799,20 +1976,18 @@ summary:hover{color:var(--fg)}
       <div class="actions" style="margin-top:12px"><button class="btn sm" id="stDl">Télécharger FFmpeg</button></div>
     </div>
     <div class="card"><h3>Performance</h3>
-      <div class="sl"><label>Tâches parallèles</label><input type="range" id="stThr" min="1" max="32" value="2"><output id="stThro">2</output><span></span></div>
+      <div class="sl"><label>Tâches parallèles</label><input type="range" id="stThr" min="1" max="8" value="2"><output id="stThro">2</output><span></span></div>
       <div class="swrow"><span class="sw"><input type="checkbox" id="stGpu" checked><span></span></span><b>Utiliser le GPU NVIDIA</b> <span class="hint">(si détecté)</span></div>
     </div>
   </div><div>
     <div class="card"><h3>Fichiers de sortie</h3>
       <div class="row"><label>Que faire ?</label><select id="stOw" class="grow">
-        <option value="replace">Remplacer l'original</option>
         <option value="suffix">Garder l'original + ajouter un suffixe</option>
         <option value="subfolder">Écrire dans un sous-dossier</option></select></div>
       <div class="row" id="stSufRow"><label>Suffixe</label><input type="text" id="stSuf" class="mono" value="_conv"></div>
       <div class="row" id="stSubRow"><label>Sous-dossier</label><input type="text" id="stSub" class="mono" value="converted"></div>
-      <div class="swrow"><span class="sw"><input type="checkbox" id="stDel" checked><span></span></span><b>Supprimer l'original après conversion</b> <span class="hint">(mode « Remplacer »)</span></div>
       <div class="swrow"><span class="sw"><input type="checkbox" id="stMeta" checked><span></span></span><b>Conserver les métadonnées</b> <span class="hint">(tags, EXIF, dates)</span></div>
-      <div class="callout warn">⚠ En mode « Remplacer », les originaux sont supprimés. Teste d'abord sur une copie.</div>
+
     </div>
     <div class="card"><h3>À propos</h3><div class="hint">Config : <span class="mono selectable" id="stCfg"></span></div></div>
   </div></div>
@@ -1836,7 +2011,7 @@ function confirmBox(t,b){return new Promise(res=>{$('#mTitle').textContent=t;$('
 /* ═════════ navigation ═════════ */
 $$('nav button').forEach(b=>b.onclick=()=>{$$('nav button').forEach(x=>x.classList.toggle('on',x===b));
   $$('.page').forEach(p=>p.classList.toggle('on',p.id==='p-'+b.dataset.p));
-  if(b.dataset.p==='combo')updateCombo(); if(b.dataset.p==='convert')updateConvSummary();});
+  if(b.dataset.p==='convert')updateConvSummary();});
 
 /* ═════════ événements Python → JS ═════════ */
 let currentRun=null;
@@ -1878,7 +2053,8 @@ class Source{
     st.innerHTML=`<span><b>${this.total}</b> fichier(s)</span><span class="tag v">${this.by.video} vidéo</span><span class="tag i">${this.by.image} image</span><span class="tag a">${this.by.audio} audio</span><span>${this.size}</span>`;
     ls.style.display='block';ls.innerHTML='';
     for(const it of this.items){const d=document.createElement('div');d.className='fitem'+(it.path===this.sel?' sel':'');
-      d.innerHTML=`<span class="tag ${it.kind[0]}">${it.kind[0].toUpperCase()}</span><span class="n" title="${it.path}">${it.name}</span><span class="s">${human(it.size)}</span>`;
+      d.innerHTML=`<span class="tag ${it.kind[0]}">${it.kind[0].toUpperCase()}</span><span class="n"></span><span class="s">${human(it.size)}</span>`;
+      $('.n',d).title=it.path;$('.n',d).textContent=it.name;
       d.onclick=()=>{this.sel=it.path;this.render();this.onChange&&this.onChange(this,true)};ls.appendChild(d)}
     if(this.total>this.items.length){const m=document.createElement('div');m.className='fitem';m.style.cursor='default';m.innerHTML=`<span class="n hint">… et ${this.total-this.items.length} autres (tous seront traités)</span>`;ls.appendChild(m)}}
   job(){return{source:this.paths.length===1?this.paths[0]:'',files:this.paths.length===1&&this.items.length&&this.total<=this.items.length&&!this.paths[0].match(/[\\/]$/)&&this._isFile?[this.paths[0]]:[],paths:this.paths,recursive:this.recursive}}
@@ -1888,7 +2064,7 @@ class Source{
 class Run{
   constructor(root,start){this.root=root;root.appendChild($('#runTpl').content.cloneNode(true));this.start=start;
     $('[data-a=go]',root).onclick=async()=>{ if(currentRun&&currentRun!==this)return; $('[data-r=log]',root).innerHTML='';$('[data-r=bar]',root).style.width='0';
-      currentRun=this;this.busy(true);const ok=await this.start();if(!ok){this.busy(false);currentRun=null}};
+      currentRun=this;this.busy(true);try{if(await this.start())return}catch(e){this.log(String(e),'err')}this.busy(false);currentRun=null};
     $('[data-a=stop]',root).onclick=()=>API.stop();
     $('[data-a=clrlog]',root).onclick=()=>$('[data-r=log]',root).innerHTML='';
     this.busy(false)}
@@ -1908,167 +2084,93 @@ const CODEC_LBL={h264:'H.264 (AVC)',h265:'H.265 (HEVC)',av1:'AV1',vp9:'VP9',vp8:
 /* ═════════ PAGE : CONVERTIR ═════════ */
 let cvSrc,cvRun;
 function initConvert(){
-  cvSrc=new Source($('#p-convert [data-src]'),updateConvSummary);
-  cvRun=new Run($('#p-convert [data-run]'),()=>startJob('convert',cvSrc));
-  const t=INFO.targets;
-  opt($('#cvV'),[['','— Ne pas convertir —'],...ORDER_V.filter(k=>t.video[k]).map(k=>[k,k.toUpperCase()+'  ·  '+t.video[k]])],CFG.cv_v??'mp4');
-  opt($('#cvI'),[['','— Ne pas convertir —'],...ORDER_I.filter(k=>t.image[k]).map(k=>[k,k.toUpperCase()+'  ·  '+t.image[k]])],CFG.cv_i??'webp');
-  opt($('#cvA'),[['','— Ne pas convertir —'],...ORDER_A.filter(k=>t.audio[k]).map(k=>[k,k.toUpperCase()+'  ·  '+t.audio[k]])],CFG.cv_a??'mp3');
-  ['cvV','cvI','cvA'].forEach(id=>$('#'+id).onchange=()=>{CFG['cv_'+id.slice(2).toLowerCase()]=$('#'+id).value;API.set_cfg('cv_'+id.slice(2).toLowerCase(),$('#'+id).value);syncCodecs();updateConvSummary();updateCombo()});
-  $('#cvQ').oninput=()=>{$('#cvQo').textContent=$('#cvQ').value;qHint();updateConvSummary()};
-  $('#cvSP').oninput=()=>$('#cvSPo').textContent=$('#cvSP').value;
+  cvSrc=new Source($('#p-convert [data-src]'),()=>{updateConvSummary();resetEditPreview()});
+  cvRun=new Run($('#p-convert [data-run]'),startEdit);
+  const formatLists=[
+    ['cvV','video',ORDER_V,['mp4','mkv','mov','webm','gif'],'mp4'],
+    ['cvI','image',ORDER_I,['jpg','png','webp','avif','heic','gif','tiff'],'webp'],
+    ['cvA','audio',ORDER_A,['mp3','m4a','wav','flac','opus'],'mp3'],
+  ];
+  function showFormats(initial=false){
+    for(const [id,kind,all,common,defaultValue] of formatLists){
+      const select=$('#'+id);
+      const wanted=initial?(CFG['cv_'+id.slice(2).toLowerCase()]??defaultValue):select.value;
+      const keys=$('#cvAllFormats').checked?all:[...new Set([...common,wanted])];
+      opt(select,[['','Même format'],...keys.filter(k=>INFO.targets[kind][k]).map(k=>[k,k.toUpperCase()])],wanted);
+      if(select.selectedIndex<0)select.value=defaultValue;
+    }
+  }
+  showFormats(true);
+  $('#cvAllFormats').onchange=()=>showFormats();
+  ['cvV','cvI','cvA'].forEach(id=>$('#'+id).onchange=()=>{CFG['cv_'+id.slice(2).toLowerCase()]=$('#'+id).value;API.set_cfg('cv_'+id.slice(2).toLowerCase(),$('#'+id).value);syncCodecs();updateConvSummary();resetEditPreview()});
+  $('#cvQ').oninput=()=>{$('#cvQo').textContent=$('#cvQ').value;qHint();updateConvSummary();resetEditPreview()};
   syncCodecs();qHint();
-  const total=INFO.src_counts;$('#cvSrcInfo').textContent=`${total.video} extensions vidéo, ${total.image} extensions image, ${total.audio} extensions audio reconnues en lecture. La conversion vers HEIC / SVG / PSD passe par Pillow si FFmpeg ne sait pas les lire.`;
+  initAdjustments();
   updateConvSummary();
 }
 function syncCodecs(){const v=$('#cvV').value,vc=INFO.video_codecs[v]||['h264'],ac=INFO.audio_codecs[v]||['aac'];
   opt($('#cvVC'),vc.map(k=>[k,CODEC_LBL[k]||k]));opt($('#cvAC'),(ac.length?ac:['aac']).map(k=>[k,CODEC_LBL[k]||k]))}
-function qHint(){const q=+$('#cvQ').value;$('#cvQh').textContent=q>=100?'Sans perte (fichiers volumineux)':q>=90?'Excellente — quasi indiscernable de l\'original':q>=75?'Très bonne':q>=55?'Bonne — bon compromis taille/qualité':q>=30?'Moyenne — fichier léger':'Basse — très compact'}
+function qHint(){const q=+$('#cvQ').value;$('#cvQh').textContent=q>=100?'Qualité maximale pour le format choisi':q>=90?'Excellente — quasi indiscernable de l\'original':q>=75?'Très bonne':q>=55?'Bonne — bon compromis taille/qualité':q>=30?'Moyenne — fichier léger':'Basse — très compact'}
 function updateConvSummary(){const t=[];const V=$('#cvV').value,I=$('#cvI').value,A=$('#cvA').value;
   if(V)t.push(`🎞 Vidéos → <b>${V.toUpperCase()}</b> (${CODEC_LBL[$('#cvVC').value]||''})`);if(I)t.push(`🖼 Images → <b>${I.toUpperCase()}</b>`);if(A)t.push(`🎵 Audios → <b>${A.toUpperCase()}</b>`);
   const o=CFG.overwrite_mode;t.push(`<br>💾 ${o==='replace'?'<span style="color:var(--warn)">Remplace les originaux</span>':o==='suffix'?'Garde l\'original, ajoute le suffixe <b>'+(CFG.suffix||'')+'</b>':'Écrit dans <b>'+(CFG.subfolder||'')+'/</b>'}`);
   if(cvSrc&&cvSrc.total)t.push(`📦 <b>${cvSrc.total}</b> fichier(s) seront examinés`);
   $('#cvSummary').innerHTML=t.length?t.join('<br>'):'Choisis au moins un format cible.'}
 
-/* ═════════ PAGE : COULEURS ═════════ */
-const COL=[['sat','Saturation',-100,100],['bri','Luminosité',-100,100],['con','Contraste',-100,100],['gam','Gamma',-100,100],['expo','Exposition',-100,100],
-  ['hue','Teinte',-180,180],['temp','Température',-100,100],['sharp','Netteté',-100,100],['denoise','Réd. bruit',0,100],['blur','Flou',0,100],['vign','Vignette',0,100],['grain','Grain',0,100]];
-const COLP={'Original':{},'Vif':{sat:35,con:12},'Pastel':{sat:-25,bri:12,con:-12},'Chaud':{temp:40,sat:10},'Froid':{temp:-40,sat:5},
-  'Cinéma':{con:22,sat:-12,temp:-15,vign:30},'Vintage':{sat:-30,temp:30,grain:35,vign:35,con:8},'Dramatique':{con:45,sat:-20,vign:45,bri:-8},'Doux':{con:-15,bri:8,blur:6,sat:-8},'Net':{sharp:60,con:10}};
-let colV={},colSrc,colRun;
-function colParams(){return{...colV,gray:$('#colGray').checked,sepia:$('#colSepia').checked,invert:$('#colInv').checked}}
-function makeSliders(host,defs,store,onc){host.innerHTML='';
-  for(const[k,l,mn,mx]of defs){store[k]=store[k]||0;const d=document.createElement('div');d.className='sl';
-    d.innerHTML=`<label>${l}</label><input type="range" min="${mn}" max="${mx}" value="${store[k]}" data-k="${k}"><output>${store[k]}</output><span class="rs" title="Remettre à 0">↺</span>`;
-    const r=$('input',d),o=$('output',d);r.oninput=()=>{store[k]=+r.value;o.textContent=(r.value>0&&mn<0?'+':'')+r.value;onc()};
-    $('.rs',d).onclick=()=>{r.value=0;r.oninput()};host.appendChild(d)}}
-function initColor(){
-  colSrc=new Source($('#p-color [data-src]'),(s,sel)=>{updColPv()},null);
-  colRun=new Run($('#p-color [data-run]'),()=>startJob('color',colSrc));
-  makeSliders($('#colSliders'),COL,colV,()=>{updColPv();updateCombo()});
-  const ch=$('#colPresets');for(const[n,v]of Object.entries(COLP)){const b=document.createElement('button');b.className='chip';b.textContent=n;
-    b.onclick=()=>{$$('#colPresets .chip').forEach(x=>x.classList.toggle('on',x===b));for(const[k]of COL)colV[k]=v[k]||0;
-      makeSliders($('#colSliders'),COL,colV,()=>{updColPv();updateCombo()});updColPv();updateCombo()};ch.appendChild(b)}
-  ['colGray','colSepia','colInv'].forEach(i=>$('#'+i).onchange=()=>{updColPv();updateCombo()});
-  $('#colReset').onclick=()=>{for(const[k]of COL)colV[k]=0;['colGray','colSepia','colInv'].forEach(i=>$('#'+i).checked=false);$$('#colPresets .chip').forEach(x=>x.classList.remove('on'));
-    makeSliders($('#colSliders'),COL,colV,()=>{updColPv();updateCombo()});updColPv();updateCombo()};
-  opt($('#colFmt'),[['','Même format que l\'original'],...ORDER_I.filter(k=>INFO.targets.image[k]).map(k=>[k,k.toUpperCase()])],'');
-  bindStage('col');
+const editColors={sat:0,bri:0,con:0,gam:0};
+let editRevision=0;
+function resetEditPreview(){
+  editRevision++;
+  clearComparison($('#cvCompare'));
+  $('#cvStatus').textContent=cvSrc.sel?'Aperçu à générer avec les réglages actuels.':'Sélectionne une image ou une vidéo.';
 }
-
-/* ═════════ aperçu générique (couleurs + resize) ═════════ */
-const PV={col:{mode:'split',pos:.5,data:null},rz:{mode:'split',pos:.5,data:null}};
-function bindStage(pfx){const st=$('#'+pfx+'Stage');const page=st.closest('.page');
-  $$('.vmodes .chip',page).forEach(b=>b.onclick=()=>{$$('.vmodes .chip',page).forEach(x=>x.classList.toggle('on',x===b));PV[pfx].mode=b.dataset.vm;drawStage(pfx)});
-  let drag=false;const mv=e=>{if(!drag)return;const r=st.getBoundingClientRect();PV[pfx].pos=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));drawStage(pfx)};
-  st.addEventListener('mousedown',e=>{if(e.target.classList.contains('divider')||PV[pfx].mode==='split'){drag=true;mv(e)}});
-  window.addEventListener('mouseup',()=>drag=false);window.addEventListener('mousemove',mv)}
-function drawStage(pfx){const st=$('#'+pfx+'Stage'),P=PV[pfx],d=P.data;if(!d)return;
-  st.querySelectorAll('img,.divider,.lab,#pvAfterWrap,.empty').forEach(e=>e.remove());
-  const mk=(src)=>{const i=document.createElement('img');i.src=src;return i};
-  if(P.mode==='before'){st.append(mk(d.before));st.insertAdjacentHTML('beforeend','<span class="lab l">Avant</span>')}
-  else if(P.mode==='after'){st.append(mk(d.after));st.insertAdjacentHTML('beforeend','<span class="lab r">Après</span>')}
-  else{st.append(mk(d.before));const w=document.createElement('div');w.id='pvAfterWrap';w.style.clipPath=`inset(0 0 0 ${P.pos*100}%)`;w.append(mk(d.after));st.append(w);
-    const dv=document.createElement('div');dv.className='divider';dv.style.left=(P.pos*100)+'%';st.append(dv);
-    st.insertAdjacentHTML('beforeend','<span class="lab l">Avant</span><span class="lab r">Après</span>')}}
-let pvSeq=0;
-async function runPreview(pfx,src,color,resize,dimsEl){
-  const st=$('#'+pfx+'Stage'),sp=$('.spin',st);
-  if(!src||!src.sel){if(!PV[pfx].data)st.innerHTML='<div class="empty">Sélectionne un fichier dans la liste<br>pour voir l\'aperçu</div><div class="spin">Calcul…</div>';return}
-  const my=++pvSeq;sp.style.display='block';
-  const r=await API.preview(src.sel,color,resize,900,0);
-  if(my!==pvSeq)return;sp.style.display='none';
-  if(!r.ok){st.querySelectorAll('img,.divider,.lab,#pvAfterWrap,.empty').forEach(e=>e.remove());st.insertAdjacentHTML('afterbegin',`<div class="empty" style="color:var(--err)">Aperçu impossible<br><span class="hint">${(r.err||'').slice(0,160)}</span></div>`);return}
-  PV[pfx].data=r;drawStage(pfx);
-  if(dimsEl&&r.orig_w){const dw=r.final_w,dh=r.final_h,same=(dw===r.orig_w&&dh===r.orig_h);const up=dw*dh>r.orig_w*r.orig_h;
-    dimsEl.innerHTML=`<span class="a">${r.orig_w}×${r.orig_h}</span><span class="arrow">→</span><span class="b">${dw}×${dh}</span>`+(same?'':`<span class="${up?'up':'down'}">${up?'▲ agrandi ×':'▼ réduit ×'}${(dw/r.orig_w).toFixed(2)}</span>`)+`<span class="hint">${((dw*dh)/1e6).toFixed(2)} Mpx</span>`}}
-const updColPv=debounce(()=>runPreview('col',colSrc,colParams(),null,$('#colDims')),220);
-const updRzPv=debounce(()=>runPreview('rz',rzSrc,{},rzParams(),$('#rzDims')),220);
-
-/* ═════════ PAGE : REDIMENSIONNER ═════════ */
-const RZM=[['height','Hauteur','Fixe la hauteur, la largeur suit'],['width','Largeur','Fixe la largeur, la hauteur suit'],['longest','Plus grand côté','Le côté le plus long = valeur'],['shortest','Plus petit côté','Le côté le plus court = valeur'],
-  ['percent','Pourcentage','% de la taille d\'origine'],['fit','Tenir dans une boîte','Garde le ratio, tient dans L×H'],['fill','Remplir une boîte','Garde le ratio, recadre'],['exact','Taille exacte','L×H exact (déforme)'],['megapix','Mégapixels','Cible un nombre de Mpx'],['off','Aucun','Ne pas redimensionner']];
-const RZP=[['16×16',16,16],['32×32',32,32],['64×64',64,64],['128',128,128],['256',256,256],['512',512,512],['480p',null,480],['720p',null,720],['1080p',null,1080],['1440p',null,1440],['4K',null,2160],['8K',null,4320],['16K',null,8640]];
-let rz={mode:'height',value:1080,w:1920,h:1080,percent:100,allow:'both',algo:'lanczos',even:false},rzSrc,rzRun;
-function rzParams(){return{...rz,algo:$('#rzAlgo').value,even:$('#rzEven').checked}}
-function numIn(id,val,min,max,unit,step){return `<input type="number" id="${id}" min="${min}" max="${max}" step="${step||1}" value="${val}"> <span class="hint">${unit}</span>`}
-function drawRzInputs(){const h=$('#rzInputs'),m=rz.mode;let s='';
-  const desc=RZM.find(x=>x[0]===m)[2];
-  const slider=(min,max,val,unit,log)=>`<div class="sl" style="grid-template-columns:1fr 130px 24px"><input type="range" id="rzSl" min="${min}" max="${max}" value="${log?Math.log2(val)*100:val}" step="1"><span>${numIn('rzVal',val,1,99999,unit)}</span><span></span></div>`;
-  if(['height','width','longest','shortest'].includes(m))s=`<div class="row"><label>Valeur</label><div class="grow" style="display:flex;gap:10px;align-items:center"><input type="range" id="rzSl" min="0" max="1500" value="${Math.log2(Math.max(1,rz.value))*100}" style="flex:1"><span style="white-space:nowrap">${numIn('rzVal',rz.value,1,65536,'px')}</span></div></div><div class="hint">Échelle logarithmique : de 1 px à 65 536 px. Tape une valeur exacte à droite.</div>`;
-  else if(m==='percent')s=`<div class="row"><label>Échelle</label><div class="grow" style="display:flex;gap:10px;align-items:center"><input type="range" id="rzSl" min="0" max="1500" value="${Math.log2(Math.max(.1,rz.percent)*10)*100/Math.log2(10000)*1.5*Math.log2(10000)/1.5/1}" style="flex:1"><span style="white-space:nowrap">${numIn('rzVal',rz.percent,.1,10000,'%',0.1)}</span></div></div><div class="chips" style="margin-top:8px">${[10,25,50,75,100,150,200,400,800].map(v=>`<button class="chip" data-pc="${v}">${v} %</button>`).join('')}</div>`;
-  else if(['fit','fill','exact'].includes(m))s=`<div class="row"><label>Largeur</label>${numIn('rzW',rz.w,1,65536,'px')}<label style="width:auto">Hauteur</label>${numIn('rzH',rz.h,1,65536,'px')}<button class="btn sm" id="rzSwap">⇄</button></div>`;
-  else if(m==='megapix')s=`<div class="row"><label>Mégapixels</label>${numIn('rzVal',rz.value>500?2:rz.value,.001,2000,'Mpx',0.1)}</div><div class="chips" style="margin-top:6px">${[.1,.5,1,2,4,8,12,24,50,100].map(v=>`<button class="chip" data-mp="${v}">${v} Mpx</button>`).join('')}</div>`;
-  else s='<div class="hint">Aucun redimensionnement.</div>';
-  h.innerHTML=`<div class="hint" style="margin-bottom:10px">${desc}</div>`+s;
-  const sl=$('#rzSl'),vi=$('#rzVal');
-  if(sl&&vi&&m!=='percent'){sl.oninput=()=>{const v=Math.max(1,Math.round(2**(sl.value/100)));vi.value=v;rz.value=v;chg()}}
-  if(sl&&m==='percent'){sl.value=Math.log2(Math.max(.1,rz.percent)*10)/Math.log2(100000)*1500;sl.oninput=()=>{const v=Math.round((2**(sl.value/1500*Math.log2(100000))/10)*10)/10;vi.value=v;rz.percent=v;chg()}}
-  if(vi)vi.oninput=()=>{const v=parseFloat(vi.value);if(!(v>0))return;if(m==='percent'){rz.percent=v;sl.value=Math.log2(v*10)/Math.log2(100000)*1500}else if(m==='megapix'){rz.value=v}else{rz.value=v;if(sl)sl.value=Math.log2(v)*100}chg()};
-  $$('[data-pc]',h).forEach(b=>b.onclick=()=>{rz.percent=+b.dataset.pc;drawRzInputs();chg()});
-  $$('[data-mp]',h).forEach(b=>b.onclick=()=>{rz.value=+b.dataset.mp;drawRzInputs();chg()});
-  if($('#rzW')){$('#rzW').oninput=e=>{rz.w=+e.target.value;chg()};$('#rzH').oninput=e=>{rz.h=+e.target.value;chg()};$('#rzSwap').onclick=()=>{[rz.w,rz.h]=[rz.h,rz.w];drawRzInputs();chg()}}
-  drawAllow()}
-function drawAllow(){const a=$('#rzAllow');a.innerHTML='';for(const[v,l]of[['both','Réduire et agrandir'],['down','Réduire seulement'],['up','Agrandir seulement']]){
-  const b=document.createElement('button');b.className='chip'+(rz.allow===v?' on':'');b.textContent=l;b.onclick=()=>{rz.allow=v;drawAllow();chg()};a.appendChild(b)}
-  $('#rzAllowH').textContent={both:'Toutes les images sont ramenées à la taille demandée (plus petites → agrandies, plus grandes → réduites).',down:'Les images déjà plus petites que la cible ne sont pas touchées.',up:'Les images déjà plus grandes que la cible ne sont pas touchées.'}[rz.allow]}
-function chg(){API.set_cfg('rz',rz);updRzPv();updateCombo()}
-function initResize(){
-  rzSrc=new Source($('#p-resize [data-src]'),()=>updRzPv(),null);
-  rzRun=new Run($('#p-resize [data-run]'),()=>startJob('resize',rzSrc));
-  if(CFG.rz)Object.assign(rz,CFG.rz);
-  const ms=$('#rzModes');for(const[k,l]of RZM){const b=document.createElement('button');b.className='chip'+(rz.mode===k?' on':'');b.textContent=l;
-    b.onclick=()=>{rz.mode=k;$$('#rzModes .chip').forEach(x=>x.classList.toggle('on',x===b));drawRzInputs();chg()};ms.appendChild(b)}
-  const ps=$('#rzPresets');for(const[l,w,h]of RZP){const b=document.createElement('button');b.className='chip';b.textContent=l;
-    b.onclick=()=>{if(w){rz.mode='exact';rz.w=w;rz.h=h;rz.allow='both'}else{rz.mode='height';rz.value=h;rz.allow='both'}
-      $$('#rzModes .chip').forEach((x,i)=>x.classList.toggle('on',RZM[i][0]===rz.mode));drawRzInputs();chg()};ps.appendChild(b)}
-  opt($('#rzFmt'),[['','Même format que l\'original'],...ORDER_I.filter(k=>INFO.targets.image[k]).map(k=>[k,k.toUpperCase()])],'');
-  $('#rzAlgo').onchange=chg;$('#rzEven').onchange=chg;$('#rzAlgo').value=rz.algo||'lanczos';
-  drawRzInputs();bindStage('rz')}
-
-/* ═════════ PAGE : TOUT-EN-UN ═════════ */
-let cbSrc,cbRun;
-function initCombo(){cbSrc=new Source($('#p-combo [data-src]'),updateCombo,null);cbRun=new Run($('#p-combo [data-run]'),()=>startJob('combo',cbSrc));
-  ['cbRz','cbCol','cbCv'].forEach(i=>$('#'+i).onchange=updateCombo)}
-function updateCombo(){const t=[];
-  if($('#cbRz').checked){const r=rzParams();t.push(r.mode==='off'?'⤢ Redimensionnement : <i>désactivé dans l\'onglet Redimensionner</i>':`⤢ Redimensionnement : <b>${RZM.find(x=>x[0]===r.mode)[1]}</b> ${['height','width','longest','shortest'].includes(r.mode)?r.value+' px':r.mode==='percent'?r.percent+' %':r.mode==='megapix'?r.value+' Mpx':r.w+'×'+r.h} (${r.allow==='both'?'↕':r.allow==='down'?'réduire':'agrandir'})`)}
-  if($('#cbCol').checked){const c=colParams(),act=Object.entries(c).filter(([k,v])=>v).map(([k])=>k);t.push('◐ Couleurs : '+(act.length?'<b>'+act.join(', ')+'</b>':'<i>aucun réglage</i>'))}
-  if($('#cbCv').checked)t.push(`⇄ Formats : vidéo <b>${$('#cvV').value||'—'}</b> · image <b>${$('#cvI').value||'—'}</b> · audio <b>${$('#cvA').value||'—'}</b>`);
-  $('#cbSummary').innerHTML=t.join('<br><br>')||'Aucune étape sélectionnée.'}
-
-/* ═════════ lancement d'un traitement ═════════ */
-async function startJob(mode,src){
-  if(!src.total){cmsg(src,'Aucun fichier sélectionné.');return false}
-  const q=+$('#cvQ').value, common={source:'',files:[],recursive:src.recursive,quality:q,speed:+$('#cvSP').value,
-    vcodec:$('#cvVC').value,acodec:$('#cvAC').value,abitrate:+$('#cvAB').value,opts:{}};
-  // liste explicite des chemins (fichiers + dossiers)
-  const all=await API.scan_paths(src.paths,src.kinds,src.recursive);
-  // on envoie les chemins d'origine : Python re-scanne (rapide) — évite de plafonner à 500 éléments
-  common.files=null;common.paths=src.paths;
-  let job={...common,mode};
-  const cv={video:$('#cvV').value,image:$('#cvI').value,audio:$('#cvA').value};
-  if(mode==='convert'){job.targets=cv;job.apply_to=['video','image','audio'];
-    if(!cv.video&&!cv.image&&!cv.audio){cmsg(src,'Choisis au moins un format cible.');return false}}
-  if(mode==='color'){job.color=colParams();job.targets={image:$('#colFmt').value};job.apply_to=$('#colVid').checked?['image','video']:['image'];
-    if(!Object.values(job.color).some(v=>v)){cmsg(src,'Aucun réglage de couleur — bouge un curseur d\'abord.');return false}}
-  if(mode==='resize'){job.resize=rzParams();job.targets={image:$('#rzFmt').value};job.apply_to=$('#rzVid').checked?['image','video']:['image'];
-    if(job.resize.mode==='off'){cmsg(src,'Mode « Aucun » : rien à faire.');return false}}
-  if(mode==='combo'){job.apply_to=['image','video','audio'];
-    job.color=$('#cbCol').checked?colParams():{};job.resize=$('#cbRz').checked?rzParams():{mode:'off'};job.targets=$('#cbCv').checked?cv:{};
-    if(!$('#cbCv').checked)job.targets={};}
-  if(CFG.overwrite_mode==='replace'){
-    const ok=await confirmBox('Remplacer les originaux ?',`<b>${src.total}</b> fichier(s) vont être modifiés <b>et les originaux supprimés</b>.<br><br>Change ce comportement dans <i>Paramètres → Fichiers de sortie</i> pour conserver tes fichiers.`);
-    if(!ok)return false}
-  const r=await API.process_paths(job);
-  if(!r.ok){cmsg(src,r.err);return false}return true}
-function cmsg(src,m){const root=src.root.closest('.page');const l=$('[data-r=log]',root);if(l){l.innerHTML=`<div class="err">${m}</div>`}}
+function initAdjustments(){
+  for(const [key,label] of [['sat','Saturation'],['bri','Luminosité'],['con','Contraste'],['gam','Gamma']]){
+    const row=document.createElement('label');row.className='sl';
+    row.innerHTML=`<span>${label}</span><input type="range" min="-100" max="100" value="0"><output>0</output>`;
+    const input=$('input',row);
+    input.oninput=()=>{editColors[key]=+input.value;$('output',row).textContent=input.value;resetEditPreview()};
+    $('#colSliders').append(row);
+  }
+  $('#colReset').onclick=()=>{$$('#colSliders input').forEach(input=>{input.value=0;input.oninput()})};
+  $('#cvHeight').value=String(CFG.edit_height||0);
+  $('#cvHeight').onchange=()=>{API.set_cfg('edit_height',+$('#cvHeight').value);resetEditPreview()};
+  $('#cvAt').onchange=resetEditPreview;
+  $('#cvPreview').onclick=async()=>{
+    if(!cvSrc.sel)return;
+    const revision=++editRevision, button=$('#cvPreview');
+    button.disabled=true;$('#cvStatus').textContent='Préparation de l’aperçu…';
+    try{
+      const r=await API.edit_preview(cvSrc.sel,editJob(),+$('#cvAt').value);
+      if(revision!==editRevision)return;
+      if(!r.ok){$('#cvStatus').textContent=r.err;return}
+      showComparison($('#cvCompare'),r,r.kind==='video'?'video':'image');
+      $('#cvStatus').textContent=r.kind==='video'?('Extraits de 5 s'+(r.size?' · export '+r.size:'')):`Export image${r.final_w?' · '+r.final_w+' × '+r.final_h:''}${r.size?' · '+r.size:''}`;
+    }catch(e){$('#cvStatus').textContent=String(e)}finally{button.disabled=false}
+  };
+}
+function editJob(){
+  const height=+$('#cvHeight').value;
+  return {mode:'combo',apply_to:['video','image','audio'],quality:+$('#cvQ').value,
+    vcodec:$('#cvVC').value,acodec:$('#cvAC').value,abitrate:+$('#cvAB').value,
+    color:{...editColors},resize:height?{mode:'height',value:height,allow:'down',algo:'lanczos',even:true}:{mode:'off'},
+    targets:{video:$('#cvV').value,image:$('#cvI').value,audio:$('#cvA').value}};
+}
+async function startEdit(){
+  if(!cvSrc.total){cvRun.log('Aucun fichier sélectionné.','err');return false}
+  const r=await API.process_paths({...editJob(),paths:cvSrc.paths,recursive:cvSrc.recursive});
+  if(!r.ok)cvRun.log(r.err,'err');
+  return r.ok;
+}
+function cmsg(src,message){
+  const log=$('[data-r=log]',src.root.closest('.page'));
+  if(log){const line=document.createElement('div');line.className='err';line.textContent=message;log.replaceChildren(line)}
+}
 
 /* ═════════ PAGE : OUTILS ═════════ */
 const TOOLS=[
- {id:'unusual_mp4',ic:'⇄',n:'Formats inhabituels → MP4',d:'TS, M3U8, M4S, MTS, M2TS : copie rapide puis H.264 si nécessaire',p:[]},
  {id:'extract_audio',ic:'🎵',n:'Extraire l\'audio',d:'Vidéo → fichier audio',p:[['sel','format','Format',['mp3','flac','wav','aac','ogg','opus','m4a'],'mp3'],['sel','bitrate','Débit (kbit/s)',[128,192,256,320],320]]},
  {id:'trim',ic:'✂',n:'Couper',d:'Garder un extrait',p:[['txt','start','Début (s ou hh:mm:ss)','0'],['txt','end','Fin (s ou hh:mm:ss)',''],['chk','lossless','Sans ré-encodage (instantané)',true]]},
- {id:'speed',ic:'⏩',n:'Vitesse',d:'Accélérer / ralentir',p:[['num','factor','Facteur (0.25 = ÷4, 2 = ×2)',1.5]]},
  {id:'gif',ic:'🎞',n:'Vidéo → GIF',d:'GIF de qualité',p:[['num','width','Largeur (px)',480],['num','fps','Images/seconde',15],['txt','start','Début (s)','0'],['num','duration','Durée (s)',5]]},
  {id:'thumbnail',ic:'📸',n:'Capture d\'image',d:'Une image de la vidéo',p:[['txt','time','À la seconde','1'],['sel','format','Format',['jpg','png','webp'],'jpg']]},
  {id:'frames',ic:'🎬',n:'Toutes les images',d:'Vidéo → séquence',p:[['txt','fps','Images par seconde','1'],['sel','format','Format',['png','jpg','webp'],'png']]},
@@ -2076,16 +2178,41 @@ const TOOLS=[
  {id:'volume',ic:'🔊',n:'Volume',d:'Monter / baisser en dB',p:[['num','db','Gain (dB)',6]]},
  {id:'normalize',ic:'📊',n:'Normaliser',d:'Volume constant (EBU R128)',p:[['num','lufs','Cible LUFS',-16]]},
  {id:'rotate',ic:'⟳',n:'Rotation / miroir',d:'Vidéo ou image',p:[['sel','angle','Action',['90','180','270','hflip','vflip'],'90']]},
- {id:'compress_target',ic:'📦',n:'Taille cible',d:'Compresser à X Mo (2 passes)',p:[['num','size_mb','Taille voulue (Mo)',25]]},
  {id:'merge',ic:'🔗',n:'Fusionner',d:'Concaténer (mêmes codecs)',p:[]},
 ];
 let toolSrc,toolRun,curTool=null,toolP={};
-function initTools(){toolSrc=new Source($('#p-tools [data-src]'),()=>{},null);toolRun=new Run($('#p-tools [data-run]'),startTool);
-  const g=$('#toolGrid');for(const t of TOOLS){const b=document.createElement('button');b.className='tool';b.dataset.id=t.id;b.innerHTML=`<span class="ic">${t.ic}</span><b>${t.n}</b><small>${t.d}</small>`;
-    b.onclick=()=>{curTool=t;toolP={};$$('.tool').forEach(x=>x.classList.toggle('on',x===b));drawToolParams(t)};g.appendChild(b)}}
-function drawToolParams(t){$('#toolTitle').textContent=t.n;const h=$('#toolParams');h.className='';h.innerHTML='';
+function initTools(){toolSrc=new Source($('#p-tools [data-src]'),()=>clearComparison($('#toolCompare')),null);toolRun=new Run($('#p-tools [data-run]'),startTool);
+  $('#toolPreview').onclick=async()=>{
+    const button=$('#toolPreview'),status=$('#toolPreviewStatus');
+    if(!toolSrc.sel){status.textContent='Sélectionne une vidéo.';return}
+    button.disabled=true;
+    status.textContent='Préparation de l’extrait…';
+    try{
+      const r=await API.montage_preview(toolSrc.sel,toolP.start||'0');
+      status.textContent=r.ok?'Extrait avant découpe':r.err;
+      if(r.ok)showComparison($('#toolCompare'),r,'video');
+    }catch(e){status.textContent=String(e)}finally{button.disabled=false}
+  };
+  const groups=[
+    ['Montage vidéo',['trim','merge','rotate']],
+    ['Images et captures',['gif','thumbnail','frames']],
+    ['Audio',['extract_audio','mute','volume','normalize']],
+  ];
+  const host=$('#toolGrid');
+  for(const [label,keys] of groups){
+    const title=document.createElement('h4');title.textContent=label;host.append(title);
+    const grid=document.createElement('div');grid.className='tools';host.append(grid);
+    for(const key of keys){
+      const t=TOOLS.find(item=>item.id===key);
+      const b=document.createElement('button');b.className='tool';
+      b.innerHTML=`<span class="ic">${t.ic}</span><b>${t.n}</b><small>${t.d}</small>`;
+      b.onclick=()=>{curTool=t;toolP={};$$('.tool').forEach(x=>x.classList.toggle('on',x===b));drawToolParams(t)};
+      grid.appendChild(b);
+    }
+  }
+}
+function drawToolParams(t){$('#toolPreviewCard').hidden=t.id!=='trim';clearComparison($('#toolCompare'));$('#toolTitle').textContent=t.n;const h=$('#toolParams');h.className='';h.innerHTML='';
   if(!t.p.length)h.innerHTML='<div class="hint">Aucun paramètre.'+(t.id==='merge'?' Les fichiers seront assemblés dans l\'ordre de la liste.':'')+'</div>';
-  if(t.id==='unusual_mp4')h.textContent='Détection des fichiers TS, M3U8, M4S, MTS et M2TS. Pour une playlist, conserve les segments et le fichier d’initialisation à leur emplacement. Un M4S isolé peut être illisible. Sortie _mp4 ; original conservé.';
   for(const[ty,k,l,a,b]of t.p){const r=document.createElement('div');r.className='row';r.innerHTML=`<label style="width:170px">${l}</label>`;let el;
     if(ty==='sel'){el=document.createElement('select');opt(el,a.map(x=>[x,x]),String(b));toolP[k]=b;el.onchange=()=>toolP[k]=el.value}
     else if(ty==='chk'){el=document.createElement('span');el.className='sw';el.innerHTML=`<input type="checkbox" ${a?'checked':''}><span></span>`;toolP[k]=a;$('input',el).onchange=e=>toolP[k]=e.target.checked}
@@ -2095,9 +2222,9 @@ async function startTool(){
   if(!curTool){cmsg(toolSrc,'Choisis un outil.');return false}
   const r=await API.scan_paths(toolSrc.paths,['video','audio','image'],toolSrc.recursive);if(!r.count){cmsg(toolSrc,'Aucun fichier.');return false}
   const fl=[];{const rr=await API.list_files(toolSrc.paths,['video','audio','image'],toolSrc.recursive);fl.push(...rr)}
-  const files=curTool.id==='unusual_mp4'?fl.filter(f=>/\.(ts|m3u8|m4s|mts|m2ts)$/i.test(f)):fl;
+  const files=fl;
   if(!files.length){toolRun.log('Aucun fichier au format concerné.','warn');return false}
-  const res=await API.run_tool({tool:curTool.id,files,params:toolP,opts:curTool.id==='unusual_mp4'?{threads:1}:{}});if(!res.ok){cmsg(toolSrc,res.err);return false}return true}
+  const res=await API.run_tool({tool:curTool.id,files,params:toolP,opts:{}});if(!res.ok){cmsg(toolSrc,res.err);return false}return true}
 
 /* ═════════ PAGE : ANALYSER ═════════ */
 $('#infoPick').onclick=async()=>{const f=await API.pick_file('all');if(!f)return;const i=await API.media_info(f);const o=$('#infoOut');
@@ -2106,17 +2233,16 @@ $('#infoPick').onclick=async()=>{const f=await API.pick_file('all');if(!f)return
   if(i.w)rows.push(['Résolution',`${i.w} × ${i.h}  (${(i.w*i.h/1e6).toFixed(2)} Mpx)`],['Codec vidéo',i.vcodec],['Images/s',i.fps],['Pixel format',i.pix]);
   if(i.acodec)rows.push(['Codec audio',i.acodec],['Fréquence',(i.sr||'?')+' Hz'],['Canaux',i.ch]);
   if(i.duration)rows.push(['Durée',new Date(i.duration*1000).toISOString().substr(11,8)]);if(i.bitrate)rows.push(['Débit total',i.bitrate+' kbit/s']);
-  o.innerHTML=rows.map(([a,b])=>`<span>${a}</span><span>${b}</span>`).join('')};
+  o.replaceChildren(...rows.flatMap(row=>row.map(value=>{const item=document.createElement('span');item.textContent=value??'—';return item})));};
 
 /* ═════════ PAGE : PARAMÈTRES ═════════ */
 function initSettings(){
-  $('#stFF').value=CFG.ffmpeg||'';$('#stCfg').textContent='mediatoolkit.json';
+  $('#stFF').value=CFG.ffmpeg||'';$('#stCfg').textContent='Préférences Windows · aucun fichier à transporter';
   const S=(id,key,ev='onchange',get=e=>e.target.value)=>{const el=$('#'+id);el[ev]=e=>{CFG[key]=get(e);API.set_cfg(key,CFG[key]);updateConvSummary();syncOw()}};
   $('#stThr').value=CFG.threads;$('#stThro').textContent=CFG.threads;$('#stThr').oninput=e=>{$('#stThro').textContent=e.target.value;CFG.threads=+e.target.value;API.set_cfg('threads',+e.target.value)};
   $('#stGpu').checked=!!CFG.use_gpu;S('stGpu','use_gpu','onchange',e=>e.target.checked);
   $('#stOw').value=CFG.overwrite_mode;S('stOw','overwrite_mode');
   $('#stSuf').value=CFG.suffix;S('stSuf','suffix','oninput');$('#stSub').value=CFG.subfolder;S('stSub','subfolder','oninput');
-  $('#stDel').checked=!!CFG.delete_source;S('stDel','delete_source','onchange',e=>e.target.checked);
   $('#stMeta').checked=!!CFG.keep_metadata;S('stMeta','keep_metadata','onchange',e=>e.target.checked);
   $('#stFF').onchange=async e=>{await API.set_cfg('ffmpeg',e.target.value);checkFF()};
   $('#stFFpick').onclick=async()=>{const p=await API.pick_exe();if(p){$('#stFF').value=p;await API.set_cfg('ffmpeg',p);checkFF()}};
@@ -2126,52 +2252,111 @@ function initSettings(){
 function syncOw(){const m=CFG.overwrite_mode;$('#stSufRow').style.display=m==='suffix'?'flex':'none';$('#stSubRow').style.display=m==='subfolder'?'flex':'none'}
 async function checkFF(path){const r=await API.check_ffmpeg(path||'');const o=$('#stFFout');
   $('#dFF').className='dot '+(r.ok?'ok':'err');$('#tFF').textContent=r.ok?'FFmpeg prêt':'FFmpeg manquant';
-  $('#dGPU').className='dot '+(r.ok&&r.gpu?'ok':'warn');$('#tGPU').textContent=r.ok&&r.gpu?'GPU NVIDIA actif':'Mode CPU';
+  $('#dGPU').className='dot '+(r.ok&&(r.gpu||r.encoders.av1_qsv)?'ok':'warn');
+  $('#tGPU').textContent=r.ok&&r.gpu?'NVIDIA détecté':r.ok&&r.encoders.av1_qsv?'Intel QSV disponible':'Encodage CPU';
   if(!r.ok){o.innerHTML='<span>État</span><span style="color:var(--err)">FFmpeg introuvable — indique son chemin ci-dessus</span>';return}
   $('#stFF').value=r.path;const good=Object.entries(r.encoders).filter(([k,v])=>v).map(([k])=>k),bad=Object.entries(r.encoders).filter(([k,v])=>!v).map(([k])=>k);
   o.innerHTML=`<span>Version</span><span>${r.version.replace('ffmpeg version ','')}</span><span>Encodeurs</span><span>${r.n_encoders} disponibles</span><span>GPU</span><span>${r.gpu?'✓ NVENC utilisable':'— non détecté'}</span>
    <span>Présents</span><span style="color:var(--ok)">${good.join(', ')||'—'}</span><span>Absents</span><span style="color:var(--fg3)">${bad.join(', ')||'aucun'}</span>`}
 
 
+function clearComparison(host){$$('video,audio',host).forEach(media=>media.pause());host.replaceChildren()}
+function showComparison(host,data,type){
+  clearComparison(host);
+  for(const [key,label] of [['before','Original'],['after','Rendu']]){
+    if(!data[key])continue;
+    const figure=document.createElement('figure'),caption=document.createElement('figcaption');
+    caption.textContent=label;figure.append(caption);
+    const media=document.createElement(type==='image'?'img':type);
+    if(type==='image')media.alt=label;else{media.controls=true;media.preload='metadata'}
+    media.src=data[key];figure.append(media);host.append(figure);
+  }
+}
 let scSrc,scRun,scRevision=0;
-function scParams(){return {video_kbps:+$('#scVideo').value,audio_kbps:+$('#scAudio').value,height:+$('#scHeight').value,codec:$('#scCodec').value,preset:$('#scPreset').value,only_smaller:$('#scSmaller').checked,at:+$('#scAt').value}}
+function scParams(){return{profile:$('#scProfile').value,encoder:$('#scEncoder').value,format:$('#scFormat').value,
+  audio_format:$('#scAudioFormat').value,target_mb:$('#scSizeMode').value==='target'?+$('#scTarget').value:0,only_smaller:true,at:+$('#scAt').value}}
+function scControls(){
+  const audio=scSrc.items.find(item=>item.path===scSrc.sel)?.kind==='audio';
+  $('#scVideoFormatRow').hidden=audio;
+  $('#scAudioFormatRow').hidden=!audio;
+  $('#scProfileRow').hidden=audio;
+  $('#scEncoderRow').hidden=audio;
+  $('#scTargetRow').hidden=$('#scSizeMode').value!=='target';
+  $('#scEncoder').disabled=$('#scProfile').value==='compatible';
+  const incompatible=$('#scProfile option[value="compatible"]');
+  incompatible.disabled=$('#scFormat').value==='webm';
+  if(incompatible.disabled && $('#scProfile').value==='compatible'){
+    $('#scProfile').value='compact';$('#scEncoder').disabled=false;
+  }
+}
 async function scChanged(){
- const rev=++scRevision; $('#scPlayer').pause(); $('#scPlayer').removeAttribute('src'); $('#scPlayer').load(); $('#scPlayer').style.display='none';
- $('#scBefore').removeAttribute('src');$('#scAfter').removeAttribute('src');$('#scStatus').textContent='Aperçu à générer avec les réglages actuels.';$('#scEstimate').textContent='';
- if(!scSrc.sel)return; const i=await API.media_info(scSrc.sel);if(rev!==scRevision)return;
- const p=scParams();if(i.duration)$('#scEstimate').textContent='Estimation pour le fichier sélectionné : '+human(i.duration*1000*((i.w?p.video_kbps:0)+(i.acodec?p.audio_kbps:0))/8)+' · source : '+i.size+' · '+Math.round(i.duration)+' s (estimation, hors conteneur).';
+  const revision=++scRevision;scControls();clearComparison($('#scCompare'));
+  $('#scStatus').textContent=scSrc.sel?'Aperçu à générer avec les réglages actuels.':'Sélectionne une vidéo ou un fichier audio.';
+  $('#scSourceInfo').textContent='';
+ $('#scEstimate').textContent='Clique sur Estimer pour calculer le temps et le poids avec ce profil.';
+  if(!scSrc.sel)return;
+  const info=await API.media_info(scSrc.sel);
+  if(revision!==scRevision||!info.ok)return;
+  $('#scSourceInfo').textContent='Source : '+info.size+(info.w?' · '+info.w+' × '+info.h:'')+(info.duration?' · '+Math.round(info.duration/60)+' min':'');
 }
 function initSmart(){
- scSrc=new Source($('#p-compress [data-src]'),scChanged,['video','audio']);const saved=CFG.smart_compress||{};
- for(const [id,key]of [['scVideo','video_kbps'],['scAudio','audio_kbps'],['scHeight','height'],['scCodec','codec'],['scPreset','preset']]){
-  if(saved[key]!==undefined)$('#'+id).value=saved[key];$('#'+id).onchange=()=>{scChanged();API.set_cfg('smart_compress',scParams())};
+  scSrc=new Source($('#p-compress [data-src]'),scChanged,['video','audio']);
+  const saved=CFG.compression||{};
+ for(const [key,name] of Object.entries(INFO.adapters||{})){
+   const option=$('#scEncoder option[value="'+key+'"]');
+   if(option)option.textContent=name+' · '+(key==='intel'?'Quick Sync':'NVENC');
  }
- $('#scAt').onchange=scChanged;
- if(saved.only_smaller!==undefined)$('#scSmaller').checked=saved.only_smaller;
- $('#scSmaller').onchange=()=>API.set_cfg('smart_compress',scParams());
- scRun=new Run($('#p-compress [data-run]'),async()=>{
-  const files=await API.list_files(scSrc.paths,['video','audio'],scSrc.recursive);
-  if(!files.length){scRun.log('Sélectionne un média.','err');return false}
-  const r=await API.run_tool({tool:'smart_compress',files,params:scParams(),opts:{threads:1}});
-  if(!r.ok)scRun.log(r.err,'err');return r.ok;
- });
- $('#scCancel').onclick=()=>API.stop();
- $('#scPlayer').onerror=()=>{if($('#scPlayer').hasAttribute('src'))$('#scStatus').textContent+=' Lecture indisponible : utilise les images avant/après ou H.264.'};
- $('#scPreview').onclick=async()=>{
-  if(!scSrc.sel){$('#scStatus').textContent='Sélectionne un fichier.';return}
-  if(currentRun||await API.is_running()){$('#scStatus').textContent='Attends la fin du traitement en cours.';return}
-  const revision=scRevision;$('#scPreview').disabled=true;$('#scCancel').disabled=false;$('#scStatus').textContent='Compression réelle de 5 secondes en cours…';
-  try{const r=await API.smart_preview(scSrc.sel,scParams());if(revision!==scRevision)return;
-   if(!r.ok){$('#scStatus').textContent=r.err;return}
-   $('#scPlayer').src=r.url;$('#scPlayer').style.display='block';if(r.before)$('#scBefore').src=r.before;if(r.after)$('#scAfter').src=r.after;
-   $('#scStatus').textContent='Extrait compressé : '+r.duration.toFixed(1)+' s · '+r.size;
-  }catch(e){$('#scStatus').textContent=String(e)}finally{$('#scPreview').disabled=false;$('#scCancel').disabled=true}
+  for(const [id,key,fallback] of [['scProfile','profile','compact'],['scEncoder','encoder','auto'],
+    ['scFormat','format','mp4'],['scAudioFormat','audio_format','m4a'],['scTarget','target_mb',500]]){
+    $('#'+id).value=saved[key]||fallback;
+  }
+  $('#scSizeMode').value=saved.target_mb?'target':'auto';
+  for(const id of ['scProfile','scEncoder','scFormat','scAudioFormat','scSizeMode','scTarget']){
+    $('#'+id).onchange=()=>{scChanged();API.set_cfg('compression',scParams())};
+  }
+  scControls();
+  $('#scAt').onchange=scChanged;
+  scRun=new Run($('#p-compress [data-run]'),async()=>{
+    if($('#scSizeMode').value==='target' && !$('#scTarget').reportValidity())return false;
+    const files=await API.list_files(scSrc.paths,['video','audio'],scSrc.recursive);
+    if(!files.length){scRun.log('Sélectionne un média.','err');return false}
+    const r=await API.run_tool({tool:'smart_compress',files,params:scParams(),opts:{threads:1}});
+    if(!r.ok)scRun.log(r.err,'err');return r.ok;
+  });
+  $('#scCancel').onclick=()=>API.stop();
+ $('#scEstimateStop').onclick=()=>API.stop();
+ $('#scEstimateButton').onclick=async()=>{
+   if(!scSrc.sel){$('#scEstimate').textContent='Sélectionne d’abord un fichier.';return}
+   if(currentRun||($('#scSizeMode').value==='target'&&!$('#scTarget').reportValidity()))return;
+   const revision=scRevision, button=$('#scEstimateButton'), stop=$('#scEstimateStop');
+   button.disabled=true;stop.hidden=false;$('#scEstimate').textContent='Test du débit et de la vitesse sur des extraits…';
+   try{
+     const r=await API.smart_estimate(scSrc.sel,scParams());
+     if(revision!==scRevision)return;
+     if(!r.ok){$('#scEstimate').textContent=r.err;return}
+     const seconds=Math.max(1,Math.round(r.duration)), minutes=Math.floor(seconds/60);
+     const time=minutes?minutes+' min '+seconds%60+' s':seconds+' s';
+     const target=scParams().target_mb;
+     $('#scEstimate').textContent=(target?'Cible : '+target+' Mo · ':'')+'Estimé : '+r.size+' (source : '+r.source_size+') · '+time+' · '+r.encoder+' · '+r.samples+' extrait(s).';
+   }catch(e){$('#scEstimate').textContent=String(e)}finally{button.disabled=false;stop.hidden=true}
  };
+  $('#scPreview').onclick=async()=>{
+    if(!scSrc.sel||currentRun||($('#scSizeMode').value==='target'&&!$('#scTarget').reportValidity()))return;
+    const revision=scRevision;
+    $('#scPreview').disabled=true;$('#scCancel').disabled=false;$('#scStatus').textContent='Compression de l’extrait en cours…';
+    try{
+      const r=await API.smart_preview(scSrc.sel,scParams());
+      if(revision!==scRevision)return;
+      if(!r.ok){$('#scStatus').textContent=r.err;return}
+      showComparison($('#scCompare'),r,r.audio?'audio':'video');
+      $('#scStatus').textContent='Extrait encodé · '+r.size+(r.audio?'':' · '+r.encoder);
+    }catch(e){$('#scStatus').textContent=String(e)}finally{$('#scPreview').disabled=false;$('#scCancel').disabled=true}
+  };
 }
 
 /* ═════════ démarrage ═════════ */
 (async()=>{await wait();API=window.pywebview.api;INFO=await API.init();CFG=INFO.cfg;
-  initSmart();initConvert();initColor();initResize();initCombo();initTools();initSettings();checkFF();})();
+  initSmart();initConvert();initTools();initSettings();checkFF();})();
 </script></body></html>
 """
 
